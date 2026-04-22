@@ -1051,7 +1051,7 @@ const FRONTEND_HTML = `
             lastTime = time;
             if (!myUser) return;
 
-            document.getElementById('coords-display').innerText = `X: ${Math.floor(wrap(camX, BOARD_SIZE))} | Y: ${Math.floor(wrap(camY, BOARD_SIZE))}`;
+            document.getElementById('coords-display').innerText = \`X: \${Math.floor(wrap(camX, BOARD_SIZE))} | Y: \${Math.floor(wrap(camY, BOARD_SIZE))}\`;
 
             let baseSpeed = 10; 
             const pxColorId = clientBoard[getIndex(Math.floor(wrap(camX, BOARD_SIZE)), Math.floor(wrap(camY, BOARD_SIZE)))];
