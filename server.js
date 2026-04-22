@@ -451,7 +451,6 @@ wss.on('connection', (ws) => {
                             ws.send(JSON.stringify({ type: 'sys', msg: 'Ruine démantelée.' }));
                         } else ws.send(JSON.stringify({ type: 'error', msg: 'Bâtiment privé.' }));
                     }
-                    else if (targetId === 15) { pixelUpdates.set(`${tx},${ty}`, 0); dbRef.stamina -= 1; }
                 }
                 else if (data.action === 'build' && data.colorId !== undefined) {
                     if (dbRef.job !== 'bâtisseur' && dbRef.job !== 'vendeur') return ws.send(JSON.stringify({ type: 'error', msg: 'Métier inadapté.' }));
@@ -1064,13 +1063,18 @@ const FRONTEND_HTML = `
         canvas.addEventListener('mousemove', (e) => { lastMouseX = e.clientX; lastMouseY = e.clientY; });
         canvas.addEventListener('mousedown', (e) => { 
             if (e.target !== canvas) return; 
-            isMouseDown = true; lastMouseX = e.clientX; lastMouseY = e.clientY; handleInteract(); 
-            interactInterval = setInterval(() => { if (isMouseDown) handleInteract(); }, 200); 
+            isMouseDown = true; lastMouseX = e.clientX; lastMouseY = e.clientY; 
+            
+            const act = handleInteract(); 
+            // On ne répète le clic en rafale QUE pour miner, construire ou tirer. On ne rafale pas les ouvertures de menu !
+            if (act && act !== 'interact') {
+                interactInterval = setInterval(() => { if (isMouseDown) handleInteract(); }, 200); 
+            }
         });
         canvas.addEventListener('mouseup', () => { isMouseDown = false; clearInterval(interactInterval); });
 
         function handleInteract() {
-            if (!myUser) return;
+            if (!myUser) return null;
             const rect = canvas.getBoundingClientRect();
             const cx = canvas.width / 2, cy = canvas.height / 2;
             const worldX = camX + (lastMouseX - rect.left - cx) / scale;
@@ -1081,18 +1085,30 @@ const FRONTEND_HTML = `
             const targetId = clientBoard[getIndex(wrappedX, wrappedY)];
 
             let action = 'interact'; 
-            if (myJob === 'ouvrier') {
-                if (targetId === 5 || targetId === 15 || targetId >= 20) action = 'mine';
-                else if (targetId === 10) action = 'craft';
+            
+            // 1. La Gomme du Bâtisseur a la priorité absolue (pour effacer même un bloc spécial)
+            if (myJob === 'bâtisseur' && selectedColorId === 255) {
+                action = 'build';
+            } 
+            // 2. Cliquer sur un Bloc Spécial force l'ouverture de son interface, peu importe le métier
+            else if ([10, 12, 13, 14, 15, 16, 17].includes(targetId)) {
+                action = 'interact';
+            } 
+            // 3. Autrement, le Clic Intelligent s'adapte au métier du joueur
+            else {
+                if (myJob === 'ouvrier') {
+                    if (targetId === 5 || targetId >= 20) action = 'mine';
+                }
+                else if (myJob === 'bâtisseur' || myJob === 'vendeur') action = 'build';
+                else if (myJob === 'fermier') {
+                    if (targetId === 1) action = 'plant';
+                    else if (targetId === 4 || targetId === 8 || targetId === 6 || targetId === 7) action = 'harvest';
+                }
+                else if (myJob === 'guerrier') action = 'shoot';
             }
-            else if (myJob === 'bâtisseur' || myJob === 'vendeur') action = 'build';
-            else if (myJob === 'fermier') {
-                if (targetId === 1) action = 'plant';
-                else if (targetId === 4 || targetId === 8 || targetId === 6 || targetId === 7) action = 'harvest';
-            }
-            else if (myJob === 'guerrier') action = 'shoot';
 
             ws.send(JSON.stringify({ type: 'interact', x: wrappedX, y: wrappedY, action, colorId: selectedColorId }));
+            return action;
         }
 
         let lastTime = performance.now();
