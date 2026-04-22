@@ -143,7 +143,7 @@ const wss = new WebSocketServer({ server });
 // PRIX ALAN STORE RÉVISÉS POUR ÉVITER LE SOFT-LOCK
 const ALANSTORE_PRICES = {
     'pioche': 50, 'graine': 10, 'graine_med': 20, 'munition': 5, 'arme': 1000, 
-    'trousse_secours': 100, 'protection_pvp': 500, 'bloc_etabli': 200, 
+    'trousse_secours': 100, 'protection_pvp': 500, 'bloc_etabli': 50, 
     'bloc_peinture': 300, 'bloc_magasin': 500, 'bloc_carte': 5000, 'moteur': 800, 
     'bloc_garage': 800, 'bloc_coffre': 1000, 'bloc_casse': 500, 'bloc_entreprise': 2000 
 };
@@ -164,7 +164,8 @@ wss.on('connection', (ws) => {
                 if (data.isRegister) {
                     if (usersDb[user]) return ws.send(JSON.stringify({ type: 'error', msg: 'Pseudo pris.' }));
                     const spawn = getRandomSpawn(data.spawnNexus);
-                    usersDb[user] = { pass: hashedPass, pix: 100, hp: 100, stamina: 100, job: "chômeur", x: spawn.x, y: spawn.y, inventory: [], vault: [], avatar: DEFAULT_AVATAR, lastJobChange: 0, pvpProtectUntil: 0 };
+                    // Démarrage avec 200 Pix pour pouvoir acheter Pioche ET Établi !
+                    usersDb[user] = { pass: hashedPass, pix: 200, hp: 100, stamina: 100, job: "chômeur", x: spawn.x, y: spawn.y, inventory: [], vault: [], avatar: DEFAULT_AVATAR, lastJobChange: 0, pvpProtectUntil: 0 };
                 } else {
                     if (!usersDb[user] || usersDb[user].pass !== hashedPass) return ws.send(JSON.stringify({ type: 'error', msg: 'Erreur login.' }));
                 }
@@ -490,7 +491,7 @@ wss.on('connection', (ws) => {
                             if (targetDb.hp <= 0) {
                                 if (targetDb.inventory.length > 0) alanStore.occasion.push(...targetDb.inventory);
                                 targetDb.inventory = []; targetDb.hp = 100;
-                                const rsp = getRandomSpawn();
+                                const rsp = getRandomSpawn(true); // GDD: Respawn Forcé au Nexus
                                 targetDb.x = rsp.x; targetDb.y = rsp.y;
                                 ostate.x = rsp.x; ostate.y = rsp.y; ostate.isDriving = null;
                                 ws.send(JSON.stringify({ type: 'sys', msg: `Kill: ${ostate.user}` }));
@@ -738,7 +739,7 @@ const FRONTEND_HTML = `
         <input type="password" id="inp-pass" placeholder="Mot de passe">
         <div style="margin: 15px 0; text-align: left;">
             <label style="font-size: 12px; cursor: pointer; color: #ccc;">
-                <input type="checkbox" id="inp-nexus-spawn" checked> Apparaître au Nexus (Zone Sûre)
+                <input type="checkbox" id="inp-nexus-spawn" checked> Apparaître au Nexus (Création de compte)
             </label>
         </div>
         <button class="btn" id="btn-login" onclick="auth(false)" disabled>1. Chargement Map...</button>
