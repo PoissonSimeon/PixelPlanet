@@ -2,7 +2,7 @@
  * PIXEL PLANET - Serveur MMO Hardcore "Single-File"
  * Architecture : Node.js + ws
  * Contrainte : < 512 Mo RAM
- * Version : 1.5 (GDD 100% Compliant)
+ * Version : 1.6 (GDD Strict, Bug Map Noir Corrigé, Flood Fill, P2P)
  */
 
 const http = require('http');
@@ -28,14 +28,16 @@ const COLORS = {
     1: '#8B4513', // Terre
     2: '#4F4F4F', // Route
     3: '#C0C0C0', // Rail
-    4: '#2ecc71', // Plante (Récoltable)
+    4: '#2ecc71', // Plante (Stamina)
     5: '#00FFFF', // Pixelium
-    6: '#a8e6cf', // Pousse (En croissance)
+    6: '#a8e6cf', // Pousse (Croissance)
+    7: '#78e08f', // Pousse médicinale
+    8: '#00b894', // Herbe médicinale (Soins HP)
     10: '#000080', // Etabli
     11: '#FF1493', // Peinture
     12: '#FF4500', // Garage
     13: '#FFD700', // Magasin (P2P)
-    14: '#2F4F4F', // Coffre-fort (Persistance)
+    14: '#2F4F4F', // Coffre-fort
     15: '#8B0000', // Casse
     16: '#00CED1', // Entreprise
     20: '#D2B48C', 21: '#E63946', 22: '#4CC9F0', 23: '#06D6A0', 24: '#FFD166', 25: '#8338EC', 26: '#FF99C8', // Bois
@@ -91,15 +93,12 @@ function hashPassword(password) { return crypto.scryptSync(password, "PixelPlane
 function isNexus(x, y) { return (x >= 475 && x < 525 && y >= 475 && y < 525); }
 function getRandomSpawn() { return { x: 500 + Math.floor(Math.random() * 10 - 5), y: 500 + Math.floor(Math.random() * 10 - 5) }; }
 
+function getZone(x, y) { return cadastre.find(z => x >= z.x && x < z.x + z.w && y >= z.y && y < z.y + z.h); }
 function canModify(username, x, y) {
     if (isNexus(x, y)) return false; 
-    const zone = cadastre.find(z => x >= z.x && x < z.x + z.w && y >= z.y && y < z.y + z.h);
+    const zone = getZone(x, y);
     if (!zone) return true; 
     return (zone.owner === username || zone.guests.includes(username));
-}
-function isInOwnBase(username, x, y) {
-    const zone = cadastre.find(z => x >= z.x && x < z.x + z.w && y >= z.y && y < z.y + z.h);
-    return zone && (zone.owner === username || zone.guests.includes(username));
 }
 
 function giveItem(user, targetInv, id, qty = 1, props = {}) {
@@ -138,9 +137,9 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server });
 
 const ALANSTORE_PRICES = {
-    'graine': 50, 'pioche': 1000, 'arme': 3000, 'protection_pvp': 2000, 'bloc_etabli': 5000, 
-    'bloc_peinture': 5000, 'bloc_magasin': 8000, 'moteur': 10000, 'bloc_garage': 10000, 
-    'bloc_coffre': 15000, 'bloc_casse': 2000 
+    'graine': 50, 'graine_med': 150, 'trousse_secours': 2000, 'pioche': 1000, 'arme': 3000, 
+    'protection_pvp': 2000, 'bloc_etabli': 5000, 'bloc_peinture': 5000, 'bloc_magasin': 8000, 
+    'moteur': 10000, 'bloc_garage': 10000, 'bloc_coffre': 15000, 'bloc_casse': 2000, 'bloc_entreprise': 20000 
 };
 
 wss.on('connection', (ws) => {
@@ -168,7 +167,7 @@ wss.on('connection', (ws) => {
                 if (!usersDb[user].vault) usersDb[user].vault = [];
 
                 ws.user = user;
-                activePlayers.set(ws.id, { user, x: usersDb[user].x, y: usersDb[user].y, isDriving: null, lastMove: 0, facing: 1, moving: false });
+                activePlayers.set(ws.id, { user, x: usersDb[user].x, y: usersDb[user].y, isDriving: null, lastMove: 0, facing: 1, moving: false, mineTicks: 0 });
 
                 const allAvatars = {};
                 for (let u in usersDb) allAvatars[u] = usersDb[u].avatar;
@@ -184,7 +183,6 @@ wss.on('connection', (ws) => {
             if (data.type === 'set_avatar') {
                 if(data.frames && data.frames.length === 3) {
                     dbRef.avatar = data.frames;
-                    ws.send(JSON.stringify({ type: 'sys', msg: 'Avatar mis à jour !' }));
                     wss.clients.forEach(c => { if(c.readyState === 1) c.send(JSON.stringify({ type: 'avatar_update', u: ws.user, a: data.frames })); });
                 }
                 return;
@@ -192,10 +190,28 @@ wss.on('connection', (ws) => {
 
             if (data.type === 'chat') {
                 const msg = data.msg.substring(0, 100); 
+                
+                // PAIEMENT P2P (GDD)
+                if (msg.startsWith('/pay ')) {
+                    const parts = msg.split(' '); const amount = parseInt(parts[2]); const target = parts[1];
+                    if (usersDb[target] && amount > 0 && dbRef.pix >= amount) {
+                        dbRef.pix -= amount; usersDb[target].pix += amount;
+                        ws.send(JSON.stringify({ type: 'sys', msg: `Payé ${amount} Pix à ${target}.` }));
+                        ws.send(JSON.stringify({ type: 'sync_stats', pix: dbRef.pix }));
+                    } else ws.send(JSON.stringify({ type: 'error', msg: 'Paiement invalide ou fonds insuffisants.' }));
+                    return;
+                }
+
+                // ADMIN HERITAGE (GDD)
+                if (msg.startsWith('/admin heritage') && ws.user === 'Admin') {
+                    const zone = getZone(playerState.x, playerState.y);
+                    if (zone) { zone.type = 'heritage'; ws.send(JSON.stringify({ type: 'sys', msg: 'Zone classée Patrimoine (Indestructible).' })); }
+                    return;
+                }
+
                 if (data.channel === 'global') {
                     if (dbRef.pix < 5) return ws.send(JSON.stringify({ type: 'error', msg: 'Fonds insuffisants (5 Pix).' }));
-                    dbRef.pix -= 5;
-                    ws.send(JSON.stringify({ type: 'sync_stats', pix: dbRef.pix }));
+                    dbRef.pix -= 5; ws.send(JSON.stringify({ type: 'sync_stats', pix: dbRef.pix }));
                     wss.clients.forEach(c => { if(c.readyState === 1) c.send(JSON.stringify({ type: 'chat', channel: 'global', user: ws.user, msg })); });
                 } else {
                     wss.clients.forEach(c => {
@@ -212,17 +228,15 @@ wss.on('connection', (ws) => {
             if (data.type === 'move') {
                 const moved = (playerState.x !== data.x || playerState.y !== data.y);
                 playerState.x = wrap(data.x, BOARD_SIZE); playerState.y = wrap(data.y, BOARD_SIZE);
-                playerState.facing = data.f;
-                playerState.moving = moved; // Track true movement for animation
-                if (moved) playerState.lastMove = Date.now();
+                playerState.facing = data.f; playerState.moving = moved;
+                if (moved) { playerState.lastMove = Date.now(); playerState.mineTicks = 0; } // Annule le minage en cours
                 dbRef.x = playerState.x; dbRef.y = playerState.y;
             }
 
-            // GESTION INVENTAIRE & PLACEMENT
             if (data.type === 'use_item') {
                 if (data.action === 'place') {
                     if (!canModify(ws.user, playerState.x, playerState.y)) return ws.send(JSON.stringify({ type: 'error', msg: 'Terrain Protégé.' }));
-                    const blockIds = { 'bloc_etabli': 10, 'bloc_garage': 12, 'bloc_magasin': 13, 'bloc_coffre': 14, 'bloc_casse': 15 };
+                    const blockIds = { 'bloc_etabli': 10, 'bloc_garage': 12, 'bloc_magasin': 13, 'bloc_coffre': 14, 'bloc_casse': 15, 'bloc_entreprise': 16 };
                     const bid = blockIds[data.item];
                     if (bid && consumeItem(ws.user, 'inventory', data.item, 1)) {
                         pixelUpdates.set(`${Math.floor(playerState.x)},${Math.floor(playerState.y)}`, bid);
@@ -230,28 +244,22 @@ wss.on('connection', (ws) => {
                     }
                 }
                 else if (data.item === 'protection_pvp') {
-                    if (consumeItem(ws.user, 'inventory', 'protection_pvp', 1)) {
-                        dbRef.pvpProtectUntil = Date.now() + 86400000; // 24h
-                        ws.send(JSON.stringify({ type: 'sys', msg: 'Invulnérabilité PvP active (24h).' }));
-                    }
+                    if (consumeItem(ws.user, 'inventory', 'protection_pvp', 1)) { dbRef.pvpProtectUntil = Date.now() + 86400000; ws.send(JSON.stringify({ type: 'sys', msg: 'Invulnérabilité PvP (24h).' })); }
+                }
+                else if (data.item === 'trousse_secours') {
+                    if (consumeItem(ws.user, 'inventory', 'trousse_secours', 1)) { dbRef.hp = 100; ws.send(JSON.stringify({ type: 'sys', msg: 'Soins max appliqués.' })); }
                 }
                 else if (data.item === 'plante') {
-                    if (consumeItem(ws.user, 'inventory', 'plante', 1)) {
-                        dbRef.stamina = 100;
-                        ws.send(JSON.stringify({ type: 'sys', msg: 'Stamina restaurée !' }));
-                    }
+                    if (consumeItem(ws.user, 'inventory', 'plante', 1)) { dbRef.stamina = 100; ws.send(JSON.stringify({ type: 'sys', msg: 'Stamina restaurée !' })); }
                 }
-                // Conduite (Type de moteur influe sur la physique)
+                else if (data.item === 'herbe') {
+                    if (consumeItem(ws.user, 'inventory', 'herbe', 1)) { dbRef.hp = Math.min(100, dbRef.hp + 20); ws.send(JSON.stringify({ type: 'sys', msg: '+20 HP restaurés !' })); }
+                }
                 else {
-                    const vehicleItem = dbRef.inventory.find(i => i.id === data.item && (i.mtype || i.id === 'vehicule'));
+                    const vehicleItem = dbRef.inventory.find(i => i.id === data.item && (i.mtype || i.id === 'vehicule_blueprint'));
                     if (vehicleItem) {
-                        if (playerState.isDriving) {
-                            playerState.isDriving = null;
-                            ws.send(JSON.stringify({ type: 'sys', msg: 'Moteur coupé.' }));
-                        } else {
-                            playerState.isDriving = vehicleItem;
-                            ws.send(JSON.stringify({ type: 'sys', msg: `Contact allumé : ${vehicleItem.mtype || 'Véhicule'}` }));
-                        }
+                        if (playerState.isDriving) { playerState.isDriving = null; ws.send(JSON.stringify({ type: 'sys', msg: 'Moteur coupé.' })); } 
+                        else { playerState.isDriving = vehicleItem; ws.send(JSON.stringify({ type: 'sys', msg: `Contact allumé : ${vehicleItem.mtype}` })); }
                     }
                 }
                 ws.send(JSON.stringify({ type: 'sync_stats', pix: dbRef.pix, hp: dbRef.hp, stamina: dbRef.stamina, inv: dbRef.inventory }));
@@ -292,6 +300,13 @@ wss.on('connection', (ws) => {
                 return;
             }
 
+            // GESTION ENTREPRISE (GDD 11.1)
+            if (data.type === 'add_guest') {
+                cadastre.forEach(z => { if (z.owner === ws.user && !z.guests.includes(data.guest)) z.guests.push(data.guest); });
+                ws.send(JSON.stringify({ type: 'sys', msg: `${data.guest} a reçu les droits sur vos terrains.` }));
+                return;
+            }
+
             if (data.type === 'buy_land') {
                 if (dbRef.pix < 100) return ws.send(JSON.stringify({ type: 'error', msg: 'Il faut 100 Pix.' }));
                 const newZone = { id: crypto.randomUUID(), x: Math.floor(playerState.x) - 5, y: Math.floor(playerState.y) - 5, w: 10, h: 10, owner: ws.user, guests: [] };
@@ -304,7 +319,6 @@ wss.on('connection', (ws) => {
                 return;
             }
 
-            // GESTION CRAFT ET GARAGE
             if (data.type === 'craft_etabli') {
                 if (consumeItem(ws.user, 'inventory', 'pixelium', 1)) {
                     dbRef.stamina -= 1;
@@ -317,20 +331,9 @@ wss.on('connection', (ws) => {
                 return;
             }
 
-            if (data.type === 'craft_garage') {
-                // Algorithme simplifié de Flood Fill (simulé) : on consomme un moteur + 20 matériaux
-                if (consumeItem(ws.user, 'inventory', 'moteur', 1)) {
-                    giveItem(ws.user, 'inventory', 'vehicule_blueprint', 1, { unique: true, mtype: 'Voiture', speed: 40 });
-                    ws.send(JSON.stringify({ type: 'sys', msg: 'Blueprint généré avec succès !' }));
-                    ws.send(JSON.stringify({ type: 'sync_stats', inv: dbRef.inventory }));
-                } else ws.send(JSON.stringify({ type: 'error', msg: 'Moteur requis dans l\'inventaire.' }));
-                return;
-            }
-
-            // INTERACTION PRINCIPALE (CLIC MAP)
             if (data.type === 'interact') {
                 const tx = wrap(data.x, BOARD_SIZE), ty = wrap(data.y, BOARD_SIZE);
-                if (toroidalDist(playerState.x, playerState.y, tx, ty) > 15) return; // Silent reject for continuous mousehold
+                if (toroidalDist(playerState.x, playerState.y, tx, ty) > 15) return; 
                 const idx = getIndex(tx, ty), targetId = board[idx];
 
                 if (isNexus(tx, ty)) {
@@ -343,10 +346,28 @@ wss.on('connection', (ws) => {
                     return;
                 }
 
-                // BLOCS SPECIAUX
                 if (data.action === 'interact') {
+                    if (targetId === 12 && dbRef.job === 'concessionnaire') {
+                        // ALGORITHME FLOOD FILL (GDD 9.1)
+                        if (!consumeItem(ws.user, 'inventory', 'moteur', 1)) return ws.send(JSON.stringify({ type: 'error', msg: 'Moteur requis dans l\'inventaire.' }));
+                        const visited = new Set(); const queue = [[tx, ty]]; let blocksCount = 0;
+                        while(queue.length > 0 && blocksCount < 225) { // 15x15 max
+                            const [cx, cy] = queue.shift(); const key = `${cx},${cy}`;
+                            if (visited.has(key)) continue; visited.add(key);
+                            if (Math.abs(cx - tx) > 7 || Math.abs(cy - ty) > 7) continue; 
+                            const cid = board[getIndex(cx, cy)];
+                            if (cid >= 20 || cid === 12) { // Absorbe carrosserie
+                                blocksCount++; pixelUpdates.set(key, 0);
+                                queue.push([wrap(cx+1, BOARD_SIZE), cy], [wrap(cx-1, BOARD_SIZE), cy], [cx, wrap(cy+1, BOARD_SIZE)], [cx, wrap(cy-1, BOARD_SIZE)]);
+                            }
+                        }
+                        giveItem(ws.user, 'inventory', 'vehicule_blueprint', 1, { unique: true, mtype: 'Custom', speed: 40, b: blocksCount });
+                        ws.send(JSON.stringify({ type: 'sys', msg: `Blueprint généré (${blocksCount} blocs) !` }));
+                        ws.send(JSON.stringify({ type: 'sync_stats', inv: dbRef.inventory }));
+                        return;
+                    }
                     if (targetId === 10 && dbRef.job === 'ouvrier') return ws.send(JSON.stringify({ type: 'open_craft' }));
-                    if (targetId === 12 && dbRef.job === 'concessionnaire') return ws.send(JSON.stringify({ type: 'open_garage' }));
+                    if (targetId === 16) return ws.send(JSON.stringify({ type: 'open_enterprise' })); // Gestion Guilde
                     if (targetId === 14) { 
                         if (!canModify(ws.user, tx, ty)) return ws.send(JSON.stringify({ type: 'error', msg: 'Ce coffre n\'est pas à vous.' }));
                         return ws.send(JSON.stringify({ type: 'open_vault', vault: dbRef.vault }));
@@ -362,35 +383,54 @@ wss.on('connection', (ws) => {
 
                 if (dbRef.stamina < 1) return ws.send(JSON.stringify({ type: 'error', msg: 'Épuisé. Mangez ou reposez-vous.' }));
 
-                if (data.action === 'mine') {
-                    if (dbRef.job !== 'ouvrier') return ws.send(JSON.stringify({ type: 'error', msg: 'Seul un Ouvrier peut miner.' }));
-                    if (targetId === 5) {
-                        pixelUpdates.set(`${tx},${ty}`, 0); dbRef.stamina -= 1; giveItem(ws.user, 'inventory', 'pixelium', 1);
-                        ws.send(JSON.stringify({ type: 'sys', msg: '+1 Pixelium' }));
-                    } else if (targetId === 15) { // Casse (Destruction de ruine/bloc persistant)
-                        pixelUpdates.set(`${tx},${ty}`, 0); dbRef.stamina -= 1;
-                        ws.send(JSON.stringify({ type: 'sys', msg: 'Bloc détruit par la Casse.' }));
+                if (data.action === 'mine' && dbRef.job === 'ouvrier') {
+                    if (targetId === 5) { // MINAGE PROLONGE OUVRIER (GDD 7.2)
+                        playerState.mineTicks++;
+                        if (playerState.mineTicks >= 4) { // 4 requêtes consécutives requises
+                            pixelUpdates.set(`${tx},${ty}`, 0); dbRef.stamina -= 1; giveItem(ws.user, 'inventory', 'pixelium', 1);
+                            playerState.mineTicks = 0; ws.send(JSON.stringify({ type: 'sys', msg: '+1 Pixelium' }));
+                        }
+                    } 
+                    else if (targetId >= 20) { // DEMANTELEMENT DES RUINES (GDD 8.2)
+                        const zone = getZone(tx, ty);
+                        if (!zone) { // Ruine publique
+                            pixelUpdates.set(`${tx},${ty}`, 0); dbRef.stamina -= 1; giveItem(ws.user, 'inventory', 'materiau_recycle', 1);
+                            ws.send(JSON.stringify({ type: 'sys', msg: 'Ruine démantelée.' }));
+                        } else ws.send(JSON.stringify({ type: 'error', msg: 'Ce bâtiment est privé.' }));
+                    }
+                    else if (targetId === 15) { // CASSE
+                        pixelUpdates.set(`${tx},${ty}`, 0); dbRef.stamina -= 1; ws.send(JSON.stringify({ type: 'sys', msg: 'Bloc détruit.' }));
                     }
                 }
                 else if (data.action === 'build' && data.colorId !== undefined) {
                     if (dbRef.job !== 'bâtisseur' && dbRef.job !== 'vendeur') return ws.send(JSON.stringify({ type: 'error', msg: 'Métier inadapté.' }));
                     if (!canModify(ws.user, tx, ty)) return ws.send(JSON.stringify({ type: 'error', msg: 'Terrain Protégé.' }));
-                    pixelUpdates.set(`${tx},${ty}`, data.colorId); dbRef.stamina -= 1;
+                    
+                    pixelUpdates.set(`${tx},${ty}`, data.colorId === 255 ? 0 : data.colorId); // 255 = Gomme du Bâtisseur
+                    dbRef.stamina -= 1;
                 }
                 else if (data.action === 'plant') {
-                    if (dbRef.job !== 'fermier') return ws.send(JSON.stringify({ type: 'error', msg: 'Seul un Fermier peut planter.' }));
+                    if (dbRef.job !== 'fermier') return ws.send(JSON.stringify({ type: 'error', msg: 'Seul un Fermier plante.' }));
                     if (targetId !== 1) return ws.send(JSON.stringify({ type: 'error', msg: 'Planter sur Terre (1).' }));
                     if (!canModify(ws.user, tx, ty)) return ws.send(JSON.stringify({ type: 'error', msg: 'Terrain Protégé.' }));
-                    pixelUpdates.set(`${tx},${ty}`, 6); activeCrops.set(`${tx},${ty}`, { plantedAt: Date.now(), owner: ws.user }); // 6 = Pousse
+                    
+                    const isMed = consumeItem(ws.user, 'inventory', 'graine_med', 1);
+                    if (!isMed && !consumeItem(ws.user, 'inventory', 'graine', 1)) return ws.send(JSON.stringify({ type: 'error', msg: 'Graine manquante.' }));
+                    
+                    pixelUpdates.set(`${tx},${ty}`, isMed ? 7 : 6); 
+                    activeCrops.set(`${tx},${ty}`, { plantedAt: Date.now(), owner: ws.user, isMed });
                     dbRef.stamina -= 1; ws.send(JSON.stringify({ type: 'sys', msg: 'Graine plantée (Pousse: 15 min).' }));
                 }
                 else if (data.action === 'harvest') {
                     if (dbRef.job !== 'fermier') return ws.send(JSON.stringify({ type: 'error', msg: 'Seul un Fermier récolte.' }));
-                    if (targetId === 4) {
+                    if (targetId !== 4 && targetId !== 8) return ws.send(JSON.stringify({ type: 'error', msg: 'Rien à récolter.' }));
+                    
+                    const crop = activeCrops.get(`${tx},${ty}`);
+                    if (crop && Date.now() - crop.plantedAt > 900000) { // 15 mins exacts (GDD 7.2)
                         pixelUpdates.set(`${tx},${ty}`, 1); activeCrops.delete(`${tx},${ty}`);
-                        giveItem(ws.user, 'inventory', 'plante', 1); dbRef.stamina -= 1;
-                        ws.send(JSON.stringify({ type: 'sys', msg: '+1 Plante (Stamina)' }));
-                    } else ws.send(JSON.stringify({ type: 'error', msg: 'Rien de prêt à récolter.' }));
+                        giveItem(ws.user, 'inventory', crop.isMed ? 'herbe' : 'plante', 1); dbRef.stamina -= 1;
+                        ws.send(JSON.stringify({ type: 'sys', msg: 'Récolte effectuée !' }));
+                    } else ws.send(JSON.stringify({ type: 'error', msg: 'Pousse en cours...' }));
                 }
                 else if (data.action === 'shoot') {
                     if (dbRef.job !== 'guerrier') return ws.send(JSON.stringify({ type: 'error', msg: 'Seul un Guerrier tire.' }));
@@ -453,7 +493,6 @@ wss.on('connection', (ws) => {
         if (ws.user) {
             const dbRef = usersDb[ws.user];
             const pState = activePlayers.get(ws.id);
-            // GDD: Si déco dans la nature, saisie. Si déco en base, sauvé.
             if (dbRef && dbRef.inventory.length > 0) {
                 if (!isInOwnBase(ws.user, pState.x, pState.y)) {
                     alanStore.occasion.push(...dbRef.inventory); 
@@ -474,16 +513,16 @@ setInterval(() => {
     const now = Date.now();
     const deltas = [];
 
-    // GDD: IMPOT FONCIER (5% de l'aire)
-    if (now - lastHour > 86400000) { // 24h
+    // GDD 8.2: IMPOT FONCIER MATHÉMATIQUE
+    if (now - lastHour > 86400000) { 
         lastHour = now;
         cadastre = cadastre.filter(zone => {
             if (zone.type === 'heritage') return true; 
             const ownerRef = usersDb[zone.owner];
             if (!ownerRef) return false;
-            let tax = Math.ceil(zone.w * zone.h * 0.05);
+            let tax = Math.ceil((zone.w * zone.h) * 0.05);
             if (ownerRef.pix >= tax) { ownerRef.pix -= tax; return true; } 
-            else return false; // Faillite
+            else return false; 
         });
     }
 
@@ -497,18 +536,23 @@ setInterval(() => {
     const tickMin = (now - lastMin > 60000);
     if (tickMin) lastMin = now;
 
-    // GDD: Pousse Agriculture (15 mins)
+    // GDD 7.2: Pousse Agriculture
     activeCrops.forEach((crop, coord) => {
-        if (now - crop.plantedAt > 900000) { // 15 mins
+        if (now - crop.plantedAt > 900000) { // 15 mins exacts
             const [cx, cy] = coord.split(',');
-            if (board[getIndex(cx, cy)] === 6) pixelUpdates.set(coord, 4); // Passe de Pousse(6) à Récoltable(4)
+            if (board[getIndex(cx, cy)] === 6) pixelUpdates.set(coord, 4); // Plante
+            if (board[getIndex(cx, cy)] === 7) pixelUpdates.set(coord, 8); // Herbe médicinale
         }
     });
 
     for (let [id, state] of activePlayers.entries()) {
         const dbRef = usersDb[state.user];
         if (!dbRef) continue;
-        if (tickMin && dbRef.hp < 100) { dbRef.hp++; state.hp = dbRef.hp; }
+        
+        // GDD 1.3: Fontaine du Nexus
+        if (tickMin && isNexus(state.x, state.y)) { dbRef.hp = Math.min(100, dbRef.hp + 1); state.hp = dbRef.hp; }
+        else if (tickMin && dbRef.hp < 100) { dbRef.hp++; state.hp = dbRef.hp; }
+        
         if (now - state.lastMove > 60000 && Math.random() < 0.1 && dbRef.stamina < 100) {
             dbRef.stamina++; state.stamina = dbRef.stamina;
         }
@@ -574,7 +618,7 @@ const FRONTEND_HTML = `
         .modal h2 { margin-top: 0; color: #f39c12; border-bottom: 1px solid #444; padding-bottom: 10px; }
         .modal .btn { width: 100%; margin-bottom: 10px; }
         
-        #modal-store, #modal-avatar, #modal-vault, #modal-shop, #modal-craft { width: 600px; }
+        #modal-store, #modal-avatar, #modal-vault, #modal-shop, #modal-craft, #modal-entreprise { width: 600px; }
         .store-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; text-align: left; }
         .store-section { background: #111; padding: 15px; border-radius: 8px; border: 1px solid #333; max-height: 250px; overflow-y: auto;}
         .store-item { display: flex; justify-content: space-between; margin-bottom: 10px; align-items: center; font-size: 12px; border-bottom: 1px solid #222; padding-bottom: 5px; }
@@ -589,7 +633,7 @@ const FRONTEND_HTML = `
 
         #notif { position: absolute; top: 70px; left: 50%; transform: translateX(-50%); padding: 10px 20px; border-radius: 20px; font-weight: bold; opacity: 0; transition: opacity 0.3s; z-index: 50; }
         #palette { display: none; position: absolute; bottom: 80px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.8); padding: 10px; border-radius: 10px; pointer-events: auto; gap: 5px; border: 1px solid #444; }
-        .color-swatch { width: 25px; height: 25px; border-radius: 5px; cursor: pointer; border: 1px solid #fff; }
+        .color-swatch { width: 25px; height: 25px; border-radius: 5px; cursor: pointer; border: 1px solid #fff; text-align:center; line-height:25px; font-size:12px; }
     </style>
 </head>
 <body>
@@ -608,7 +652,7 @@ const FRONTEND_HTML = `
             <div class="pix-count">🪙 <span id="ui-pix">0</span> Pix</div>
             <div style="display:flex; gap:10px;">
                 <button class="btn" style="background:#e67e22; width:auto; margin:0;" onclick="buyLand()">Acheter Terrain (100 Pix)</button>
-                <button class="btn" style="width:auto; margin:0;" onclick="openStore()">AlanStore (Système)</button>
+                <button class="btn" style="width:auto; margin:0;" onclick="openStore()">AlanStore</button>
             </div>
         </div>
 
@@ -620,12 +664,12 @@ const FRONTEND_HTML = `
             <div id="chat-input-container">
                 <button onclick="chatMode='global'; document.getElementById('chat-input').placeholder='Global (-5 Pix)...'" style="background:transparent; border:none; color:#f39c12; cursor:pointer;">🌍</button>
                 <button onclick="chatMode='local'; document.getElementById('chat-input').placeholder='Local...'" style="background:transparent; border:none; color:#bdc3c7; cursor:pointer;">🗣️</button>
-                <input type="text" id="chat-input" placeholder="Local..." onkeypress="if(event.key==='Enter') sendChat()">
+                <input type="text" id="chat-input" placeholder="/pay [pseudo] [mt] ou Local..." onkeypress="if(event.key==='Enter') sendChat()">
             </div>
         </div>
 
         <div id="inv-container">
-            <h4 style="margin:0 0 10px 0; color:#f39c12;">Sac (Perdu si Mort/Déco)</h4>
+            <h4 style="margin:0 0 10px 0; color:#f39c12;">Sac (Perdu si Mort)</h4>
             <div id="inv-list"></div>
         </div>
 
@@ -659,14 +703,12 @@ const FRONTEND_HTML = `
         <button class="btn" style="background:#555" onclick="document.getElementById('modal-nexus').classList.remove('show')">Fermer</button>
     </div>
 
-    <!-- MODAL CRAFT (ÉTABLI) -->
     <div class="modal" id="modal-craft">
         <h2>Établi (Ouvrier)</h2>
         <p>1 Pixelium requis pour chaque recette.</p>
         <button class="btn" onclick="craft('pix')">Frapper 10 Pix 🪙</button>
         <button class="btn" onclick="craft('bois')">Tailler 10 Bois 🪵</button>
         <button class="btn" onclick="craft('pierre')">Tailler 10 Pierre 🪨</button>
-        <br><br>
         <button class="btn" style="background:#555" onclick="document.getElementById('modal-craft').classList.remove('show')">Fermer</button>
     </div>
 
@@ -683,6 +725,14 @@ const FRONTEND_HTML = `
         <h2>Échoppe P2P</h2>
         <div id="shop-content"></div>
         <button class="btn" style="background:#555" onclick="document.getElementById('modal-shop').classList.remove('show')">Fermer</button>
+    </div>
+
+    <div class="modal" id="modal-entreprise">
+        <h2>Guilde (Entreprise)</h2>
+        <p>Donnez les droits de construction sur tous vos terrains.</p>
+        <input type="text" id="inp-guest" placeholder="Pseudonyme du Guest">
+        <button class="btn" onclick="ws.send(JSON.stringify({ type: 'add_guest', guest: document.getElementById('inp-guest').value.trim() })); document.getElementById('modal-entreprise').classList.remove('show')">Ajouter aux Droits</button>
+        <button class="btn" style="background:#555" onclick="document.getElementById('modal-entreprise').classList.remove('show')">Fermer</button>
     </div>
 
     <div class="modal" id="modal-store">
@@ -714,25 +764,22 @@ const FRONTEND_HTML = `
         const BOARD_SIZE = 1000;
         let scale = 15; 
         let camX = 500, camY = 500;
-        let myUser = null;
-        let myJob = null;
+        let myUser = null, myJob = null;
         let isDriving = null;
         let selectedColorId = 20; 
-        let chatMode = 'local';
-        let currentShopCoord = null;
+        let chatMode = 'local', currentShopCoord = null;
+        
+        // Local Cache of the Board to prevent getImageData freezes
+        let clientBoard = new Uint8Array(BOARD_SIZE * BOARD_SIZE);
         
         let offCanvas = document.createElement('canvas');
         offCanvas.width = BOARD_SIZE; offCanvas.height = BOARD_SIZE;
         let offCtx = offCanvas.getContext('2d');
         
-        let playersMap = [];
-        let colorDict = {};
-        let avatarsDict = {}; 
-        
+        let playersMap = [], colorDict = {}, avatarsDict = {}; 
         let currentAvatarEdit = [Array(25).fill(255), Array(25).fill(255), Array(25).fill(255)];
         let selectedAvatarColor = 20;
         
-        // AZERTY + QWERTY
         const keys = { w:false, a:false, s:false, d:false, z:false, q:false, arrowup:false, arrowdown:false, arrowleft:false, arrowright:false };
         let facingRight = true;
 
@@ -746,6 +793,14 @@ const FRONTEND_HTML = `
         }
 
         const wrap = (val, max) => ((val % max) + max) % max;
+        const getIndex = (x, y) => (y * BOARD_SIZE) + x;
+
+        function getContinuousPos(vx, vy, cx, cy) {
+            let dx = (vx - wrap(cx, BOARD_SIZE)); let dy = (vy - wrap(cy, BOARD_SIZE));
+            if (dx > BOARD_SIZE / 2) dx -= BOARD_SIZE; if (dx < -BOARD_SIZE / 2) dx += BOARD_SIZE;
+            if (dy > BOARD_SIZE / 2) dy -= BOARD_SIZE; if (dy < -BOARD_SIZE / 2) dy += BOARD_SIZE;
+            return { x: cx + dx, y: cy + dy };
+        }
 
         function initNet() {
             const btn = document.getElementById('btn-login');
@@ -753,6 +808,7 @@ const FRONTEND_HTML = `
             .then(res => { if(!res.ok) throw new Error(); return res.arrayBuffer(); })
             .then(buffer => {
                 const view = new Uint8Array(buffer);
+                for(let i=0; i<view.length; i++) clientBoard[i] = view[i];
                 const imgData = offCtx.createImageData(BOARD_SIZE, BOARD_SIZE);
                 connectSocket(view, imgData);
             }).catch(() => { btn.innerText = "Erreur Map"; });
@@ -793,7 +849,7 @@ const FRONTEND_HTML = `
                 else if (data.type === 'alanstore_res') renderAlanStore(data.occ, data.prices);
                 else if (data.type === 'avatar_update') avatarsDict[data.u] = data.a;
                 else if (data.type === 'open_craft') document.getElementById('modal-craft').classList.add('show');
-                else if (data.type === 'open_garage') { ws.send(JSON.stringify({ type: 'craft_garage' })); } // Simplification UI FloodFill
+                else if (data.type === 'open_enterprise') document.getElementById('modal-entreprise').classList.add('show');
                 else if (data.type === 'open_vault') { renderVault(data.inv || [], data.vault); document.getElementById('modal-vault').classList.add('show'); }
                 else if (data.type === 'manage_shop') { currentShopCoord = data.coord; renderManageShop(data.shop); document.getElementById('modal-shop').classList.add('show'); }
                 else if (data.type === 'view_shop') { currentShopCoord = data.coord; renderViewShop(data.shop); document.getElementById('modal-shop').classList.add('show'); }
@@ -803,7 +859,10 @@ const FRONTEND_HTML = `
                 }
                 else if (data.type === 'tick') {
                     playersMap = data.p;
-                    for (let d of data.d) { offCtx.fillStyle = colorDict[d.c] || '#000'; offCtx.fillRect(d.x, d.y, 1, 1); }
+                    for (let d of data.d) { 
+                        clientBoard[getIndex(d.x, d.y)] = d.c;
+                        offCtx.fillStyle = colorDict[d.c] || '#000'; offCtx.fillRect(d.x, d.y, 1, 1); 
+                    }
                     const me = playersMap.find(p => p.u === myUser);
                     if (me) isDriving = me.d;
                 }
@@ -830,7 +889,7 @@ const FRONTEND_HTML = `
                 const invList = document.getElementById('inv-list');
                 invList.innerHTML = state.inv.map(i => {
                     let btn = '';
-                    if (i.id === 'plante' || i.id === 'vehicule' || i.id === 'moteur' || i.id === 'protection_pvp') btn = \`<button class="inv-btn" onclick="useItem('\${i.id}')">Utiliser</button>\`;
+                    if (['plante', 'herbe', 'vehicule_blueprint', 'moteur', 'protection_pvp', 'trousse_secours'].includes(i.id)) btn = \`<button class="inv-btn" onclick="useItem('\${i.id}')">Utiliser</button>\`;
                     if (i.id.startsWith('bloc_')) btn = \`<button class="inv-btn" style="background:#8e44ad" onclick="ws.send(JSON.stringify({type:'use_item', action:'place', item:'\${i.id}'}))">Poser</button>\`;
                     return \`<div class="inv-slot"><span>\${formatItemLabel(i)} x\${i.qty}</span>\${btn}</div>\`;
                 }).join('');
@@ -876,7 +935,7 @@ const FRONTEND_HTML = `
         canvas.addEventListener('mousemove', (e) => { lastMouseX = e.clientX; lastMouseY = e.clientY; });
         canvas.addEventListener('mousedown', (e) => { 
             isMouseDown = true; lastMouseX = e.clientX; lastMouseY = e.clientY; handleInteract(); 
-            interactInterval = setInterval(() => { if (isMouseDown) handleInteract(); }, 200); // Rafale continue (Ouvrier/Batisseur)
+            interactInterval = setInterval(() => { if (isMouseDown) handleInteract(); }, 200); 
         });
         canvas.addEventListener('mouseup', () => { isMouseDown = false; clearInterval(interactInterval); });
 
@@ -905,17 +964,17 @@ const FRONTEND_HTML = `
             let baseSpeed = 10; 
             const wrappedCamX = wrap(Math.floor(camX), BOARD_SIZE);
             const wrappedCamY = wrap(Math.floor(camY), BOARD_SIZE);
-            const pxData = offCtx.getImageData(wrappedCamX, wrappedCamY, 1, 1).data;
-            const pxColorId = board ? board[getIndex(wrappedCamX, wrappedCamY)] : 0;
+            
+            const pxColorId = clientBoard[getIndex(wrappedCamX, wrappedCamY)];
             
             if (isDriving) {
-                if (isDriving === 'Train') baseSpeed = (pxColorId === 3) ? 45 : 0; // Train sur Rails 
-                else if (isDriving === 'Tracteur') baseSpeed = 15; // Constant
-                else baseSpeed = (pxColorId === 2) ? 30 : 5; // Voiture (Route vs Terrain)
+                if (isDriving === 'Train') baseSpeed = (pxColorId === 3) ? 45 : 0; 
+                else if (isDriving === 'Tracteur') baseSpeed = 15; 
+                else baseSpeed = (pxColorId === 2) ? 30 : 5; 
             } 
 
             let moved = false;
-            if (keys.w || keys.arrowup) { camY -= baseSpeed * dt; moved = true; }
+            if (keys.w || keys.z || keys.arrowup) { camY -= baseSpeed * dt; moved = true; }
             if (keys.s || keys.arrowdown) { camY += baseSpeed * dt; moved = true; }
             if (keys.a || keys.q || keys.arrowleft) { camX -= baseSpeed * dt; moved = true; }
             if (keys.d || keys.arrowright) { camX += baseSpeed * dt; moved = true; }
@@ -928,7 +987,6 @@ const FRONTEND_HTML = `
             ctx.save(); ctx.translate(canvas.width / 2, canvas.height / 2); ctx.scale(scale, scale); ctx.translate(-camX, -camY);
             ctx.imageSmoothingEnabled = false;
             
-            // RENDU TORE (Grille 3x3 Dynamique)
             const startX = Math.floor(camX / BOARD_SIZE) * BOARD_SIZE;
             const startY = Math.floor(camY / BOARD_SIZE) * BOARD_SIZE;
             
@@ -944,21 +1002,17 @@ const FRONTEND_HTML = `
             }
 
             for (let p of playersMap) {
-                // Projection Torique de la position
-                let dx = p.x - camX; let dy = p.y - camY;
-                if (dx > BOARD_SIZE / 2) dx -= BOARD_SIZE; if (dx < -BOARD_SIZE / 2) dx += BOARD_SIZE;
-                if (dy > BOARD_SIZE / 2) dy -= BOARD_SIZE; if (dy < -BOARD_SIZE / 2) dy += BOARD_SIZE;
-                const cpx = camX + dx; const cpy = camY + dy;
+                const cPos = getContinuousPos(p.x, p.y, camX, camY);
 
                 ctx.save();
-                ctx.translate(cpx, cpy);
+                ctx.translate(cPos.x, cPos.y);
 
                 if (p.d) { 
                     ctx.fillStyle = (p.u === myUser) ? '#e67e22' : '#d35400'; ctx.fillRect(-7, -7, 15, 15); 
                 } else {
                     const av = avatarsDict[p.u];
                     if (av) {
-                        ctx.scale(p.f, 1); // Orientation
+                        ctx.scale(p.f, 1); 
                         const frameIdx = p.m ? (Math.floor(Date.now() / 200) % 2) + 1 : 0;
                         const frameData = av[frameIdx];
                         for (let i=0; i<25; i++) {
@@ -970,12 +1024,11 @@ const FRONTEND_HTML = `
                 }
                 ctx.restore();
 
-                // PSEUDO VISIBLE (Fond noir + Stroke)
                 ctx.font = '3px Arial'; ctx.textAlign = 'center';
                 const textW = ctx.measureText(p.u).width;
-                ctx.fillStyle = "rgba(0, 0, 0, 0.6)"; ctx.fillRect(cpx - textW/2 - 1, cpy - 8, textW + 2, 4);
-                ctx.strokeStyle = "black"; ctx.lineWidth = 0.5; ctx.strokeText(p.u, cpx, cpy - 5);
-                ctx.fillStyle = 'white'; ctx.fillText(p.u, cpx, cpy - 5);
+                ctx.fillStyle = "rgba(0, 0, 0, 0.6)"; ctx.fillRect(cPos.x - textW/2 - 1, cPos.y - 8, textW + 2, 4);
+                ctx.strokeStyle = "black"; ctx.lineWidth = 0.5; ctx.strokeText(p.u, cPos.x, cPos.y - 5);
+                ctx.fillStyle = 'white'; ctx.fillText(p.u, cPos.x, cPos.y - 5);
             }
             ctx.restore();
         }
@@ -991,7 +1044,13 @@ const FRONTEND_HTML = `
 
         function renderAlanStore(occasionData, prices) {
             const sysList = document.getElementById('sys-store-list');
-            const items = [{id:'pioche',n:'Pioche'},{id:'moteur',n:'Moteur'},{id:'arme',n:'Arme'},{id:'protection_pvp',n:'Bouclier PvP'},{id:'bloc_etabli',n:'Établi'},{id:'bloc_peinture',n:'Peinture'},{id:'bloc_garage',n:'Garage'},{id:'bloc_magasin',n:'Magasin'},{id:'bloc_coffre',n:'Coffre'},{id:'bloc_casse',n:'Casse'},{id:'bloc_entreprise',n:'Entreprise'}];
+            const items = [
+                {id:'pioche',n:'Pioche'},{id:'moteur',n:'Moteur'},{id:'arme',n:'Arme'},
+                {id:'graine',n:'Graines'},{id:'graine_med',n:'Graines Médicinales'},{id:'trousse_secours',n:'Trousse Secours'},
+                {id:'protection_pvp',n:'Bouclier PvP'},{id:'bloc_etabli',n:'Établi'},{id:'bloc_peinture',n:'Peinture'},
+                {id:'bloc_garage',n:'Garage'},{id:'bloc_magasin',n:'Magasin'},{id:'bloc_coffre',n:'Coffre'},
+                {id:'bloc_casse',n:'Casse'},{id:'bloc_entreprise',n:'Entreprise'}
+            ];
             sysList.innerHTML = items.map(i => \`<div class="store-item"><span>\${i.n}</span><button class="inv-btn" onclick="buySys('\${i.id}')">\${prices[i.id]} Pix</button></div>\`).join('');
             const occList = document.getElementById('occasion-list');
             if (occasionData.length === 0) occList.innerHTML = "<p style='font-size:12px;color:#888'>Aucun butin saisi.</p>";
@@ -1001,6 +1060,13 @@ const FRONTEND_HTML = `
         function buildPalette() {
             const pal = document.getElementById('palette'); pal.innerHTML = '';
             const buildable = [20, 21, 22, 23, 30, 31, 32, 2, 1, 10, 11, 12, 13, 14, 15, 16]; 
+            
+            // L'outil "Gomme" du Bâtisseur (ID 255 efface la zone et remet Nature)
+            const gommeDiv = document.createElement('div');
+            gommeDiv.className = 'color-swatch'; gommeDiv.style.background = '#000'; gommeDiv.style.borderColor = 'red'; gommeDiv.innerText = 'X';
+            gommeDiv.onclick = () => { selectedColorId = 255; document.querySelectorAll('.color-swatch').forEach(el => el.style.borderColor = 'white'); gommeDiv.style.borderColor = '#f1c40f'; };
+            pal.appendChild(gommeDiv);
+
             for (let id of buildable) {
                 const div = document.createElement('div');
                 div.className = 'color-swatch'; div.style.backgroundColor = colorDict[id];
@@ -1016,7 +1082,7 @@ const FRONTEND_HTML = `
             tDiv.onclick = () => { selectedAvatarColor = 255; document.querySelectorAll('.color-swatch-mini').forEach(el => el.style.borderColor = 'white'); tDiv.style.borderColor = '#f1c40f'; };
             pal.appendChild(tDiv);
             for (let id in colorDict) {
-                if (id == 0 || id == 5) continue; 
+                if (id == 0 || id == 5 || id == 4 || id == 6 || id == 7 || id == 8) continue; 
                 const div = document.createElement('div'); div.className = 'color-swatch-mini'; div.style.backgroundColor = colorDict[id];
                 div.onclick = () => { selectedAvatarColor = id; document.querySelectorAll('.color-swatch-mini').forEach(el => el.style.borderColor = 'white'); div.style.borderColor = '#f1c40f'; };
                 pal.appendChild(div);
