@@ -384,7 +384,7 @@ wss.on('connection', (ws) => {
                 if (dbRef.stamina < 1) return ws.send(JSON.stringify({ type: 'error', msg: 'Épuisé. Mangez ou reposez-vous.' }));
 
                 if (data.action === 'mine' && dbRef.job === 'ouvrier') {
-                    if (targetId === 5) { // MINAGE INSTANTANÉ (UX Corrigée)
+                    if (targetId === 5) { // MINAGE INSTANTANÉ (Corrigé)
                         pixelUpdates.set(`${tx},${ty}`, 0); dbRef.stamina -= 1; giveItem(ws.user, 'inventory', 'pixelium', 1);
                         ws.send(JSON.stringify({ type: 'sys', msg: '+1 Pixelium' }));
                     } 
@@ -560,7 +560,8 @@ setInterval(() => {
         if (board[getIndex(rx, ry)] === 0 && !isNexus(rx, ry)) pixelUpdates.set(`${rx},${ry}`, 5); 
     }
 
-    const playersData = Array.from(activePlayers.values()).map(p => ({ u: p.user, x: p.x, y: p.y, d: p.isDriving ? p.isDriving.mtype : null, m: p.moving, f: p.facing }));
+    // L'animation s'arrête si le joueur n'a pas bougé depuis 150 ms
+    const playersData = Array.from(activePlayers.values()).map(p => ({ u: p.user, x: p.x, y: p.y, d: p.isDriving ? p.isDriving.mtype : null, m: (now - p.lastMove < 150), f: p.facing }));
     const broadcastMsg = JSON.stringify({ type: 'tick', p: playersData, d: deltas });
     wss.clients.forEach(c => { if (c.readyState === 1) c.send(broadcastMsg); });
 
@@ -931,7 +932,7 @@ const FRONTEND_HTML = `
 
         canvas.addEventListener('mousemove', (e) => { lastMouseX = e.clientX; lastMouseY = e.clientY; });
         canvas.addEventListener('mousedown', (e) => { 
-            if (e.target !== canvas) return; // Empêche de cliquer à travers l'interface (UI)
+            if (e.target !== canvas) return; // Empêche de cliquer à travers l'interface UI
             isMouseDown = true; lastMouseX = e.clientX; lastMouseY = e.clientY; handleInteract(); 
             interactInterval = setInterval(() => { if (isMouseDown) handleInteract(); }, 200); 
         });
@@ -948,7 +949,7 @@ const FRONTEND_HTML = `
             const wrappedY = wrap(worldY, BOARD_SIZE);
             const targetId = clientBoard[getIndex(wrappedX, wrappedY)];
 
-            let action = 'interact'; // Clic intelligent selon la cible !
+            let action = 'interact'; // Clic intelligent : l'action dépend de ce qu'on pointe !
             if (myJob === 'ouvrier') {
                 if (targetId === 5 || targetId === 15 || targetId >= 20) action = 'mine';
                 else if (targetId === 10) action = 'craft';
