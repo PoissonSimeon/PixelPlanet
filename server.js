@@ -182,7 +182,7 @@ wss.on('connection', (ws) => {
                 if (!usersDb[user].vault) usersDb[user].vault = [];
 
                 ws.user = user;
-                activePlayers.set(ws.id, { user, x: usersDb[user].x, y: usersDb[user].y, isDriving: null, lastMove: 0, facing: 1, moving: false, mineTicks: 0 });
+                activePlayers.set(ws.id, { user, x: usersDb[user].x, y: usersDb[user].y, isDriving: null, lastMove: 0, facing: 1, moving: false, mineTicks: 0, invisible: false });
 
                 const allAvatars = {};
                 for (let u in usersDb) allAvatars[u] = usersDb[u].avatar;
@@ -233,11 +233,38 @@ wss.on('connection', (ws) => {
                     } else ws.send(JSON.stringify({ type: 'error', msg: 'Paiement invalide ou fonds insuffisants.' }));
                     return;
                 }
-                if (msg.startsWith('/admin heritage') && ws.user === 'Admin') {
-                    const zone = getZone(playerState.x, playerState.y);
-                    if (zone) { zone.type = 'heritage'; broadcastCadastre(); ws.send(JSON.stringify({ type: 'sys', msg: 'Zone classée Patrimoine.' })); }
-                    return;
+                
+                // --- POUVOIRS ADMIN ---
+                if (msg.startsWith('/admin ') && ws.user === 'Admin') {
+                    if (msg === '/admin money') {
+                        dbRef.pix += 1000000;
+                        ws.send(JSON.stringify({ type: 'sys', msg: 'Argent illimité activé ! (+1M Pix)' }));
+                        ws.send(JSON.stringify({ type: 'sync_stats', pix: dbRef.pix }));
+                    } 
+                    else if (msg.startsWith('/admin tp ')) {
+                        const parts = msg.split(' ');
+                        const nx = parseInt(parts[2]), ny = parseInt(parts[3]);
+                        if (!isNaN(nx) && !isNaN(ny)) {
+                            playerState.x = wrap(nx, BOARD_SIZE); playerState.y = wrap(ny, BOARD_SIZE);
+                            dbRef.x = playerState.x; dbRef.y = playerState.y;
+                            ws.send(JSON.stringify({ type: 'sys_tp', x: playerState.x, y: playerState.y }));
+                            ws.send(JSON.stringify({ type: 'sys', msg: `Téléportation en X:${playerState.x} Y:${playerState.y}` }));
+                        }
+                    }
+                    else if (msg === '/admin invis') {
+                        playerState.invisible = !playerState.invisible;
+                        ws.send(JSON.stringify({ type: 'sys', msg: playerState.invisible ? 'Invisibilité ACTIVÉE.' : 'Invisibilité DÉSACTIVÉE.' }));
+                    }
+                    else if (msg === '/admin heritage') {
+                        const zone = getZone(playerState.x, playerState.y);
+                        if (zone) { zone.type = 'heritage'; broadcastCadastre(); ws.send(JSON.stringify({ type: 'sys', msg: 'Zone classée Patrimoine.' })); }
+                    }
+                    else if (msg === '/admin help') {
+                        ws.send(JSON.stringify({ type: 'sys', msg: 'Commandes: /admin money, /admin tp [x] [y], /admin invis, /admin heritage' }));
+                    }
+                    return; // Empêche la diffusion des commandes dans le chat public
                 }
+
                 if (data.channel === 'global') {
                     if (dbRef.pix < 5) return ws.send(JSON.stringify({ type: 'error', msg: 'Fonds insuffisants (5 Pix).' }));
                     dbRef.pix -= 5; ws.send(JSON.stringify({ type: 'sync_stats', pix: dbRef.pix }));
@@ -636,7 +663,7 @@ setInterval(() => {
 
     for (let [id, p] of activePlayers.entries()) { if (now - p.lastMove > 150) p.moving = false; }
 
-    const playersData = Array.from(activePlayers.values()).map(p => ({ u: p.user, x: p.x, y: p.y, d: p.isDriving ? p.isDriving.mtype : null, m: p.moving, f: p.facing }));
+    const playersData = Array.from(activePlayers.values()).map(p => ({ u: p.user, x: p.x, y: p.y, d: p.isDriving ? p.isDriving.mtype : null, m: p.moving, f: p.facing, inv: p.invisible }));
     const broadcastMsg = JSON.stringify({ type: 'tick', p: playersData, d: deltas });
     wss.clients.forEach(c => { if (c.readyState === 1) c.send(broadcastMsg); });
 
@@ -971,6 +998,7 @@ const FRONTEND_HTML = `
                 else if (data.type === 'sys') notify(data.msg);
                 else if (data.type === 'sync_stats') { updateHUD(data); if(data.vault) renderVault(data.inv, data.vault); }
                 else if (data.type === 'sync_cadastre') clientCadastre = data.cadastre; // Mise à jour dynamique des terrains
+                else if (data.type === 'sys_tp') { camX = data.x; camY = data.y; } // Téléportation
                 else if (data.type === 'alanstore_res') renderAlanStore(data.occ, data.prices);
                 else if (data.type === 'avatar_update') avatarsDict[data.u] = data.a;
                 else if (data.type === 'open_craft') document.getElementById('modal-craft').classList.add('show');
@@ -1068,13 +1096,17 @@ const FRONTEND_HTML = `
 
         function updateScoreboard() {
             const list = document.getElementById('score-list');
-            document.getElementById('score-count').innerText = playersMap.length;
-            list.innerHTML = playersMap.map(p => {
+            // Cache les joueurs invisibles, sauf si c'est nous-même ou si on est l'Admin
+            const visiblePlayers = playersMap.filter(p => !p.inv || p.u === myUser || myUser === 'Admin');
+            
+            document.getElementById('score-count').innerText = visiblePlayers.length;
+            list.innerHTML = visiblePlayers.map(p => {
                 const isMe = p.u === myUser;
-                return \`<div style="display:flex; justify-content:space-between; background:#111; border:1px solid #333; padding:8px 12px; border-radius:5px;">
-                    <span style="font-weight:bold; color:\${isMe ? '#f1c40f' : 'white'}">\${p.u}</span>
-                    <span style="color:#aaa; font-family:monospace;">X:\${Math.floor(p.x)} Y:\${Math.floor(p.y)}</span>
-                </div>\`;
+                const invisTag = p.inv ? '<span style="color:#e74c3c; font-size:10px;"> [INVIS]</span>' : '';
+                return `<div style="display:flex; justify-content:space-between; background:#111; border:1px solid #333; padding:8px 12px; border-radius:5px;">
+                    <span style="font-weight:bold; color:${isMe ? '#f1c40f' : 'white'}">${p.u}${invisTag}</span>
+                    <span style="color:#aaa; font-family:monospace;">X:${Math.floor(p.x)} Y:${Math.floor(p.y)}</span>
+                </div>`;
             }).join('');
         }
 
@@ -1102,6 +1134,15 @@ const FRONTEND_HTML = `
             if (document.activeElement.tagName === 'INPUT') return;
             
             if(keys[k] !== undefined) keys[k] = false; 
+        });
+
+        // ZOOM (Molette) - Dézoom infini exclusif à l'Admin
+        canvas.addEventListener('wheel', (e) => {
+            const zoomAmount = e.deltaY > 0 ? 0.9 : 1.1;
+            scale *= zoomAmount;
+            const minScale = (myUser === 'Admin') ? 0.5 : 10;
+            if (scale < minScale) scale = minScale;
+            if (scale > 40) scale = 40;
         });
 
         let interactInterval = null; let isMouseDown = false; let lastMouseX = 0, lastMouseY = 0;
@@ -1217,6 +1258,9 @@ const FRONTEND_HTML = `
             }
 
             for (let p of playersMap) {
+                // L'Admin voit tout le monde. Les autres joueurs ne voient pas les invisibles.
+                if (p.inv && p.u !== myUser && myUser !== 'Admin') continue;
+
                 const cPos = getContinuousPos(p.x, p.y, camX, camY);
 
                 ctx.save(); ctx.translate(cPos.x, cPos.y);
