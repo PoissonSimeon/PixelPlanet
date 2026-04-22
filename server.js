@@ -2,7 +2,7 @@
  * PIXEL PLANET - Serveur MMO Hardcore "Single-File"
  * Architecture : Node.js + ws
  * Contrainte : < 512 Mo RAM
- * Version : 1.1 (AlanStore & Économie Complète)
+ * Version : 1.2 (Corrections Tore, Nexus, Pixelium, UI)
  */
 
 const http = require('http');
@@ -24,11 +24,12 @@ const ALANSTORE_FILE = path.join(__dirname, 'alanstore.json');
 
 // Dictionnaire des Palettes
 const COLORS = {
-    0: '#FFFFFF', // Nature (Pixelium)
+    0: '#FFFFFF', // Nature (Support de spawn)
     1: '#8B4513', // Terre
     2: '#4F4F4F', // Route
     3: '#C0C0C0', // Rail
     4: '#2ecc71', // Plante (Fermier - pousse)
+    5: '#00FFFF', // Pixelium (Minerai Brillant)
     10: '#000080', // Etabli
     11: '#FF1493', // Peinture
     12: '#FF4500', // Garage
@@ -129,19 +130,10 @@ const server = http.createServer((req, res) => {
 // --- 6. WEBSOCKET ET GAME LOOP ---
 const wss = new WebSocketServer({ server });
 
-// PRIX SYSTÈMES OFFICIELS (AlanStore) - Volontairement prohibitifs
 const ALANSTORE_PRICES = {
-    'graine': 50,
-    'pioche': 1000, 
-    'arme': 3000, 
-    'protection_pvp': 2000,
-    'etabli': 5000, 
-    'bloc_peinture': 5000, 
-    'bloc_magasin': 8000, 
-    'moteur': 10000, 
-    'bloc_garage': 10000, 
-    'coffre': 15000, 
-    'bloc_entreprise': 20000 
+    'graine': 50, 'pioche': 1000, 'arme': 3000, 'protection_pvp': 2000, 'etabli': 5000, 
+    'bloc_peinture': 5000, 'bloc_magasin': 8000, 'moteur': 10000, 'bloc_garage': 10000, 
+    'coffre': 15000, 'bloc_entreprise': 20000 
 };
 
 wss.on('connection', (ws) => {
@@ -203,12 +195,10 @@ wss.on('connection', (ws) => {
             }
 
             if (data.type === 'use_item') {
-                // Utilisation des blueprints/véhicules (Conduite)
                 if (data.item === 'vehicule' || data.item === 'moteur') {
                     playerState.isDriving = !playerState.isDriving;
                     ws.send(JSON.stringify({ type: 'sys', msg: playerState.isDriving ? 'Contact allumé !' : 'Moteur coupé.' }));
                 }
-                // Soins
                 if (data.item === 'plante') {
                     if (consumeItem(ws.user, 'plante', 1)) {
                         dbRef.stamina = 100;
@@ -237,20 +227,29 @@ wss.on('connection', (ws) => {
 
                 const idx = getIndex(tx, ty), targetId = board[idx];
 
-                if (isNexus(tx, ty) && data.action === 'change_job') {
-                    dbRef.job = data.job;
-                    ws.send(JSON.stringify({ type: 'sys', msg: `Métier : ${data.job}`}));
-                    ws.send(JSON.stringify({ type: 'sync_stats', job: dbRef.job }));
+                // Protection du Nexus
+                if (isNexus(tx, ty)) {
+                    if (data.action === 'change_job') {
+                        dbRef.job = data.job;
+                        ws.send(JSON.stringify({ type: 'sys', msg: `Métier : ${data.job}`}));
+                        ws.send(JSON.stringify({ type: 'sync_stats', job: dbRef.job }));
+                    } else {
+                        ws.send(JSON.stringify({ type: 'error', msg: 'Le Nexus est une zone pacifique protégée.' }));
+                    }
                     return;
                 }
 
                 if (dbRef.stamina < 1) return ws.send(JSON.stringify({ type: 'error', msg: 'Épuisé. Mangez ou reposez-vous.' }));
 
                 if (dbRef.job === 'ouvrier') {
-                    if (data.action === 'mine' && targetId === 0) {
-                        pixelUpdates.set(`${tx},${ty}`, 20); // 20 = bois clair (épuisé)
-                        dbRef.stamina -= 1; giveItem(ws.user, 'pixelium', 1);
-                        ws.send(JSON.stringify({ type: 'sys', msg: '+1 Pixelium' }));
+                    if (data.action === 'mine') {
+                        if (targetId === 5) { // 5 = Pixelium
+                            pixelUpdates.set(`${tx},${ty}`, 0); // Redevient nature (blanc) après récolte
+                            dbRef.stamina -= 1; giveItem(ws.user, 'pixelium', 1);
+                            ws.send(JSON.stringify({ type: 'sys', msg: '+1 Pixelium' }));
+                        } else if (targetId === 0) {
+                            ws.send(JSON.stringify({ type: 'error', msg: 'Pas de minerai ici.' }));
+                        }
                     }
                     if (data.action === 'craft' && targetId === 10) { // 10 = Etabli
                         if (consumeItem(ws.user, 'pixelium', 1)) { dbRef.pix += 10; dbRef.stamina -= 1; ws.send(JSON.stringify({ type: 'sys', msg: '1 Pixelium -> 10 Pix' })); }
@@ -280,13 +279,18 @@ wss.on('connection', (ws) => {
                     }
                 }
                 else if (dbRef.job === 'guerrier') {
-                    if (data.action === 'shoot' && !isNexus(tx, ty)) {
+                    if (data.action === 'shoot') {
+                        if (isNexus(playerState.x, playerState.y)) return ws.send(JSON.stringify({ type: 'error', msg: 'Impossible de tirer depuis le Nexus.' }));
+                        
                         dbRef.stamina -= 1;
                         for (let [oid, ostate] of activePlayers.entries()) {
-                            if (oid !== ws.id && Math.hypot(ostate.x - tx, ostate.y - ty) < 4 && !isNexus(ostate.x, ostate.y)) {
+                            if (oid !== ws.id && Math.hypot(ostate.x - tx, ostate.y - ty) < 4) {
+                                if (isNexus(ostate.x, ostate.y)) {
+                                    ws.send(JSON.stringify({ type: 'error', msg: 'Cible protégée par le Nexus.' }));
+                                    continue;
+                                }
                                 usersDb[ostate.user].hp -= ostate.isDriving ? 10 : 20; 
                                 if (usersDb[ostate.user].hp <= 0) {
-                                    // PUNITIF: Saisie de l'inventaire et envoi au marché d'occasion
                                     if (usersDb[ostate.user].inventory.length > 0) {
                                         alanStore.occasion.push(...usersDb[ostate.user].inventory);
                                     }
@@ -305,20 +309,18 @@ wss.on('connection', (ws) => {
                 ws.send(JSON.stringify({ type: 'sync_stats', hp: dbRef.hp, stamina: dbRef.stamina, inv: dbRef.inventory }));
             }
             
-            // --- 6.7 ALAN STORE (REFAIT) ---
+            // --- 6.7 ALAN STORE ---
             if (data.type === 'alanstore_req') {
                 ws.send(JSON.stringify({ type: 'alanstore_res', occ: alanStore.occasion, prices: ALANSTORE_PRICES }));
                 return;
             }
 
-            // Achat boutique Système (Gacha appliqué)
             if (data.type === 'alanstore_buy_sys') {
                 const cost = ALANSTORE_PRICES[data.item];
                 if (cost && dbRef.pix >= cost) {
                     dbRef.pix -= cost;
                     let props = { unique: false };
                     
-                    // GACHA RULES
                     if (data.item === 'pioche') props = { unique: true, speed: Math.floor(Math.random() * 10) + 1 };
                     else if (data.item === 'arme') props = { unique: true, dmg: Math.floor(Math.random() * 20) + 10 };
                     else if (data.item === 'moteur') {
@@ -326,32 +328,30 @@ wss.on('connection', (ws) => {
                         props = { unique: true, mtype: mtypes[Math.floor(Math.random() * mtypes.length)], speed: Math.floor(Math.random() * 50) + 20 };
                     }
                     else if (data.item.startsWith('bloc_') || data.item === 'coffre' || data.item === 'etabli') {
-                        // Les blocs spéciaux ne sont pas empilables pour éviter les abus d'inventaire
                         props = { unique: true };
                     }
 
                     giveItem(ws.user, data.item, 1, props);
                     ws.send(JSON.stringify({ type: 'sync_stats', pix: dbRef.pix, hp: dbRef.hp, stamina: dbRef.stamina, inv: dbRef.inventory, job: dbRef.job }));
-                    ws.send(JSON.stringify({ type: 'sys', msg: `Achat système réussi : ${data.item}` }));
-                    ws.send(JSON.stringify({ type: 'alanstore_res', occ: alanStore.occasion, prices: ALANSTORE_PRICES })); // refresh
+                    ws.send(JSON.stringify({ type: 'sys', msg: `Achat réussi : ${data.item}` }));
+                    ws.send(JSON.stringify({ type: 'alanstore_res', occ: alanStore.occasion, prices: ALANSTORE_PRICES })); 
                 } else {
                     ws.send(JSON.stringify({ type: 'error', msg: 'Fonds insuffisants.' }));
                 }
             }
 
-            // Achat Marché de l'Occasion (Prix Fixe de Rachat : 50 Pix le lot/objet)
             if (data.type === 'alanstore_buy_occ') {
                 const idx = data.index;
-                const occPrice = 50; // Le prix du Ferrailleur
+                const occPrice = 50; 
                 if (alanStore.occasion[idx] && dbRef.pix >= occPrice) {
                     const item = alanStore.occasion[idx];
                     dbRef.pix -= occPrice;
-                    alanStore.occasion.splice(idx, 1); // Retire du marché
+                    alanStore.occasion.splice(idx, 1); 
                     giveItem(ws.user, item.id, item.qty, item);
                     
                     ws.send(JSON.stringify({ type: 'sync_stats', pix: dbRef.pix, inv: dbRef.inventory }));
-                    ws.send(JSON.stringify({ type: 'sys', msg: `Lot récupéré aux occasions !` }));
-                    ws.send(JSON.stringify({ type: 'alanstore_res', occ: alanStore.occasion, prices: ALANSTORE_PRICES })); // refresh
+                    ws.send(JSON.stringify({ type: 'sys', msg: `Lot récupéré !` }));
+                    ws.send(JSON.stringify({ type: 'alanstore_res', occ: alanStore.occasion, prices: ALANSTORE_PRICES })); 
                 } else {
                     ws.send(JSON.stringify({ type: 'error', msg: 'Erreur ou 50 Pix manquants.' }));
                 }
@@ -363,9 +363,6 @@ wss.on('connection', (ws) => {
     ws.on('close', () => { 
         if (ws.user) {
             const dbRef = usersDb[ws.user];
-            // SAISIE DE L'INVENTAIRE (Si on quitte hors d'un bloc Coffre)
-            // Dans un monde idéal, on vérifierait si le joueur est sur son coffre.
-            // Ici, la règle hardcore s'applique : l'inventaire tombe dans l'AlanStore à chaque déco pour alimenter l'occasion.
             if (dbRef && dbRef.inventory.length > 0) {
                 alanStore.occasion.push(...dbRef.inventory);
                 dbRef.inventory = [];
@@ -406,10 +403,13 @@ setInterval(() => {
         }
     }
 
-    if (Math.random() < 0.1) {
+    // Spawn Naturel Pixelium (Apparaît en Cyan Brillant, ID 5)
+    if (Math.random() < 0.2) {
         const rx = Math.floor(Math.random() * BOARD_SIZE);
         const ry = Math.floor(Math.random() * BOARD_SIZE);
-        if (board[getIndex(rx, ry)] === 0) pixelUpdates.set(`${rx},${ry}`, 0); 
+        if (board[getIndex(rx, ry)] === 0 && !isNexus(rx, ry)) {
+            pixelUpdates.set(`${rx},${ry}`, 5); 
+        }
     }
 
     const playersData = Array.from(activePlayers.values()).map(p => ({ u: p.user, x: p.x, y: p.y, d: p.isDriving }));
@@ -463,15 +463,18 @@ const FRONTEND_HTML = `
         .inv-btn { background: #27ae60; border: none; color: white; border-radius: 3px; cursor: pointer; padding: 2px 5px; font-size: 10px; }
 
         .bottom-bar { background: rgba(0,0,0,0.9); padding: 15px; pointer-events: auto; display: flex; justify-content: center; gap: 15px; border-top: 1px solid #333; }
-        .btn { background: #34495e; color: white; border: 1px solid #555; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-weight: bold; transition: 0.2s; }
+        .btn { background: #34495e; color: white; border: 1px solid #555; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-weight: bold; transition: 0.2s; box-sizing: border-box; }
         .btn:hover:not(:disabled) { background: #2c3e50; border-color: #f39c12; }
         
-        .modal { display: none; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(20,20,20,0.95); padding: 30px; border-radius: 15px; border: 1px solid #555; z-index: 100; pointer-events: auto; text-align: center; max-height: 80vh; overflow-y: auto; width: 600px; }
+        /* Correction de l'alignement des modales */
+        .modal { display: none; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(20,20,20,0.95); padding: 30px; border-radius: 15px; border: 1px solid #555; z-index: 100; pointer-events: auto; text-align: center; max-height: 80vh; overflow-y: auto; width: 350px; box-sizing: border-box; }
         .modal.show { display: block; }
-        .modal input { display: block; width: 100%; margin: 10px 0; padding: 10px; background: #000; border: 1px solid #444; color: white; border-radius: 5px; }
+        .modal input { display: block; width: 100%; margin: 15px 0; padding: 12px; background: #111; border: 1px solid #444; color: white; border-radius: 5px; box-sizing: border-box; font-size: 14px; }
         .modal h2 { margin-top: 0; color: #f39c12; border-bottom: 1px solid #444; padding-bottom: 10px; }
+        .modal .btn { width: 100%; margin-bottom: 10px; }
         
         /* ALAN STORE SPECIFIC */
+        #modal-store { width: 600px; }
         .store-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; text-align: left; }
         .store-section { background: #111; padding: 15px; border-radius: 8px; border: 1px solid #333; }
         .store-item { display: flex; justify-content: space-between; margin-bottom: 10px; align-items: center; font-size: 12px; border-bottom: 1px solid #222; padding-bottom: 5px; }
@@ -496,7 +499,7 @@ const FRONTEND_HTML = `
                 </div>
             </div>
             <div class="pix-count">🪙 <span id="ui-pix">0</span> Pix</div>
-            <div>
+            <div style="display:flex; gap:10px;">
                 <button class="btn" style="background:#e67e22" onclick="buyLand()">Acheter Terrain (100 Pix)</button>
                 <button class="btn" onclick="openStore()">AlanStore (Système)</button>
             </div>
@@ -520,13 +523,13 @@ const FRONTEND_HTML = `
         </div>
 
         <div class="bottom-bar">
-            <button class="btn" id="btn-interact" style="background:#8e44ad">Interagir (Clic Maintenu / Clic)</button>
-            <button class="btn" onclick="document.getElementById('modal-nexus').classList.add('show')">Nexus (Métiers)</button>
+            <button class="btn" id="btn-interact" style="background:#8e44ad; width:auto; margin:0">Interagir (Clic Maintenu / Clic)</button>
+            <button class="btn" onclick="document.getElementById('modal-nexus').classList.add('show')" style="width:auto; margin:0">Nexus (Métiers)</button>
         </div>
     </div>
 
     <!-- MODAL LOGIN -->
-    <div class="modal show" id="modal-login" style="width:300px">
+    <div class="modal show" id="modal-login">
         <h2>PIXEL PLANET</h2>
         <p>Le MMO Hardcore 512 Mo.</p>
         <input type="text" id="inp-user" placeholder="Pseudonyme (Min 3 char)">
@@ -536,17 +539,17 @@ const FRONTEND_HTML = `
     </div>
 
     <!-- MODAL NEXUS -->
-    <div class="modal" id="modal-nexus" style="width:300px">
+    <div class="modal" id="modal-nexus">
         <h2>NEXUS</h2>
         <p>Changez de métier.</p>
         <button class="btn" onclick="changeJob('ouvrier')">⛏️ Ouvrier</button>
         <button class="btn" onclick="changeJob('bâtisseur')">🧱 Bâtisseur</button>
         <button class="btn" onclick="changeJob('fermier')">🌾 Fermier</button>
         <button class="btn" onclick="changeJob('guerrier')">⚔️ Guerrier</button>
-        <button class="btn" onclick="changeJob('vendeur')" style="margin-top:10px">💰 Vendeur</button>
-        <button class="btn" onclick="changeJob('concessionnaire')" style="margin-top:10px">🏎️ Concessionnaire</button>
+        <button class="btn" onclick="changeJob('vendeur')">💰 Vendeur</button>
+        <button class="btn" onclick="changeJob('concessionnaire')">🏎️ Concessionnaire</button>
         <br><br>
-        <button class="btn" onclick="document.getElementById('modal-nexus').classList.remove('show')">Fermer</button>
+        <button class="btn" style="background:#555" onclick="document.getElementById('modal-nexus').classList.remove('show')">Fermer</button>
     </div>
 
     <!-- MODAL STORE -->
@@ -572,7 +575,7 @@ const FRONTEND_HTML = `
         </div>
 
         <br>
-        <button class="btn" onclick="document.getElementById('modal-store').classList.remove('show')">Fermer la boutique</button>
+        <button class="btn" style="width:auto; margin:10px auto 0 auto;" onclick="document.getElementById('modal-store').classList.remove('show')">Fermer la boutique</button>
     </div>
 
     <script>
@@ -606,6 +609,9 @@ const FRONTEND_HTML = `
             el.style.opacity = 1;
             setTimeout(() => el.style.opacity = 0, 3000);
         }
+
+        // --- MATH: Enroulement Torique ---
+        const wrap = (val, max) => ((val % max) + max) % max;
 
         function initNet() {
             const btn = document.getElementById('btn-login');
@@ -727,7 +733,10 @@ const FRONTEND_HTML = `
             if (!myUser) return;
 
             let baseSpeed = 10; 
-            const pxData = offCtx.getImageData(Math.floor(camX), Math.floor(camY), 1, 1).data;
+            // On récupère le pixel local avec la position wrappée
+            const wrappedCamX = wrap(Math.floor(camX), BOARD_SIZE);
+            const wrappedCamY = wrap(Math.floor(camY), BOARD_SIZE);
+            const pxData = offCtx.getImageData(wrappedCamX, wrappedCamY, 1, 1).data;
             const onRoute = (pxData[0] === 79 && pxData[1] === 79 && pxData[2] === 79); 
             
             if (isDriving) { baseSpeed = onRoute ? 30 : 5; } 
@@ -736,6 +745,10 @@ const FRONTEND_HTML = `
             if (keys.s) camY += baseSpeed * dt;
             if (keys.a) camX -= baseSpeed * dt;
             if (keys.d) camX += baseSpeed * dt;
+
+            // Maintien local de camX/camY dans la limite de l'univers torique
+            camX = wrap(camX, BOARD_SIZE);
+            camY = wrap(camY, BOARD_SIZE);
 
             if (Math.random() < 0.3) ws.send(JSON.stringify({ type: 'move', x: camX, y: camY }));
 
@@ -746,25 +759,56 @@ const FRONTEND_HTML = `
             ctx.translate(-camX, -camY);
 
             ctx.imageSmoothingEnabled = false;
-            ctx.drawImage(offCanvas, 0, 0);
-            ctx.drawImage(offCanvas, -BOARD_SIZE, 0); ctx.drawImage(offCanvas, BOARD_SIZE, 0);
-            ctx.drawImage(offCanvas, 0, -BOARD_SIZE); ctx.drawImage(offCanvas, 0, BOARD_SIZE);
-
-            for (let p of playersMap) {
-                if (p.d) { 
-                    ctx.fillStyle = (p.u === myUser) ? '#e67e22' : '#d35400';
-                    ctx.fillRect(p.x - 7, p.y - 7, 15, 15); 
-                } else {
-                    ctx.fillStyle = (p.u === myUser) ? '#f1c40f' : '#e74c3c';
-                    ctx.fillRect(p.x - 2, p.y - 2, 5, 5); 
-                }
-                ctx.fillStyle = 'white'; ctx.font = '3px Arial';
-                ctx.fillText(p.u, p.x - 3, p.y - 3);
-            }
             
-            ctx.strokeStyle = "rgba(0, 255, 255, 0.3)";
-            ctx.lineWidth = 1;
-            ctx.strokeRect(475, 475, 50, 50);
+            // RENDU TORIQUE (Matrice 3x3 pour supprimer les coupures au bord)
+            for (let dx = -1; dx <= 1; dx++) {
+                for (let dy = -1; dy <= 1; dy++) {
+                    const offsetX = dx * BOARD_SIZE;
+                    const offsetY = dy * BOARD_SIZE;
+                    ctx.drawImage(offCanvas, offsetX, offsetY);
+                    
+                    // Indicateur de la Zone Sûre (Nexus)
+                    ctx.fillStyle = "rgba(0, 255, 255, 0.15)";
+                    ctx.fillRect(475 + offsetX, 475 + offsetY, 50, 50);
+                    ctx.strokeStyle = "rgba(0, 255, 255, 0.5)";
+                    ctx.lineWidth = 1;
+                    ctx.strokeRect(475 + offsetX, 475 + offsetY, 50, 50);
+                    ctx.fillStyle = "rgba(0, 255, 255, 0.8)";
+                    ctx.font = '2px Arial';
+                    ctx.textAlign = 'center';
+                    ctx.fillText("NEXUS (Zone Pacifique)", 500 + offsetX, 500 + offsetY);
+                }
+            }
+
+            // RENDU DES JOUEURS (Matrice 3x3 pour le franchissement fluide)
+            for (let p of playersMap) {
+                for (let dx = -1; dx <= 1; dx++) {
+                    for (let dy = -1; dy <= 1; dy++) {
+                        let px = p.x + dx * BOARD_SIZE;
+                        let py = p.y + dy * BOARD_SIZE;
+                        
+                        // Optimisation : On ne dessine pas les copies trop lointaines de la caméra
+                        if (Math.abs(px - camX) > canvas.width/scale/2 + 20 || Math.abs(py - camY) > canvas.height/scale/2 + 20) continue;
+
+                        if (p.d) { 
+                            ctx.fillStyle = (p.u === myUser) ? '#e67e22' : '#d35400';
+                            ctx.fillRect(px - 7, py - 7, 15, 15); 
+                        } else {
+                            ctx.fillStyle = (p.u === myUser) ? '#f1c40f' : '#e74c3c';
+                            ctx.fillRect(px - 2, py - 2, 5, 5); 
+                        }
+                        
+                        // Pseudo avec contour noir pour visibilité parfaite
+                        ctx.font = '3px Arial';
+                        ctx.textAlign = 'center';
+                        ctx.strokeStyle = 'black';
+                        ctx.lineWidth = 1;
+                        ctx.strokeText(p.u, px, py - 4);
+                        ctx.fillStyle = 'white'; 
+                        ctx.fillText(p.u, px, py - 4);
+                    }
+                }
+            }
 
             ctx.restore();
         }
@@ -783,7 +827,6 @@ const FRONTEND_HTML = `
         function buyOcc(index) { ws.send(JSON.stringify({ type: 'alanstore_buy_occ', index })); }
 
         function renderAlanStore(occasionData, prices) {
-            // Rendu Catalogue (Gacha)
             const sysList = document.getElementById('sys-store-list');
             const items = [
                 {id: 'pioche', n: 'Pioche (Vitesse aléatoire)'}, {id: 'moteur', n: 'Moteur (Type/Vit aléatoire)'}, {id: 'arme', n: 'Arme (Dégâts aléatoires)'},
@@ -798,7 +841,6 @@ const FRONTEND_HTML = `
                 </div>\`
             ).join('');
 
-            // Rendu Occasion
             const occList = document.getElementById('occasion-list');
             if (occasionData.length === 0) {
                 occList.innerHTML = "<p style='font-size:12px;color:#888'>Aucun butin saisi par le système pour le moment.</p>";
