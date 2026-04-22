@@ -1103,10 +1103,10 @@ const FRONTEND_HTML = `
             list.innerHTML = visiblePlayers.map(p => {
                 const isMe = p.u === myUser;
                 const invisTag = p.inv ? '<span style="color:#e74c3c; font-size:10px;"> [INVIS]</span>' : '';
-                return `<div style="display:flex; justify-content:space-between; background:#111; border:1px solid #333; padding:8px 12px; border-radius:5px;">
-                    <span style="font-weight:bold; color:${isMe ? '#f1c40f' : 'white'}">${p.u}${invisTag}</span>
-                    <span style="color:#aaa; font-family:monospace;">X:${Math.floor(p.x)} Y:${Math.floor(p.y)}</span>
-                </div>`;
+                return \`<div style="display:flex; justify-content:space-between; background:#111; border:1px solid #333; padding:8px 12px; border-radius:5px;">
+                    <span style="font-weight:bold; color:\${isMe ? '#f1c40f' : 'white'}">\${p.u}\${invisTag}</span>
+                    <span style="color:#aaa; font-family:monospace;">X:\${Math.floor(p.x)} Y:\${Math.floor(p.y)}</span>
+                </div>\`;
             }).join('');
         }
 
