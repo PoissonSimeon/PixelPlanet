@@ -145,6 +145,11 @@ const server = http.createServer((req, res) => {
 // --- 6. WEBSOCKET ---
 const wss = new WebSocketServer({ server });
 
+function broadcastCadastre() {
+    const msg = JSON.stringify({ type: 'sync_cadastre', cadastre });
+    wss.clients.forEach(c => { if (c.readyState === 1) c.send(msg); });
+}
+
 const ALANSTORE_PRICES = {
     'pioche': 50, 'graine': 10, 'graine_med': 20, 'munition': 5, 'arme': 1000, 
     'trousse_secours': 100, 'protection_pvp': 500, 'bloc_etabli': 50, 
@@ -182,7 +187,7 @@ wss.on('connection', (ws) => {
                 const allAvatars = {};
                 for (let u in usersDb) allAvatars[u] = usersDb[u].avatar;
 
-                ws.send(JSON.stringify({ type: 'auth_success', state: usersDb[user], colors: COLORS, avatars: allAvatars }));
+                ws.send(JSON.stringify({ type: 'auth_success', state: usersDb[user], colors: COLORS, avatars: allAvatars, cadastre: cadastre }));
                 return;
             }
 
@@ -198,6 +203,7 @@ wss.on('connection', (ws) => {
                     if (dbRef.vault && dbRef.vault.length > 0) alanStore.occasion.push(...dbRef.vault);
                     
                     cadastre = cadastre.filter(z => z.owner !== ws.user);
+                    broadcastCadastre(); // Actualise les terrains pour tout le monde
                     
                     delete usersDb[ws.user];
                     activePlayers.delete(ws.id);
@@ -229,7 +235,7 @@ wss.on('connection', (ws) => {
                 }
                 if (msg.startsWith('/admin heritage') && ws.user === 'Admin') {
                     const zone = getZone(playerState.x, playerState.y);
-                    if (zone) { zone.type = 'heritage'; ws.send(JSON.stringify({ type: 'sys', msg: 'Zone classée Patrimoine.' })); }
+                    if (zone) { zone.type = 'heritage'; broadcastCadastre(); ws.send(JSON.stringify({ type: 'sys', msg: 'Zone classée Patrimoine.' })); }
                     return;
                 }
                 if (data.channel === 'global') {
@@ -338,6 +344,7 @@ wss.on('connection', (ws) => {
 
             if (data.type === 'add_guest') {
                 cadastre.forEach(z => { if (z.owner === ws.user && !z.guests.includes(data.guest)) z.guests.push(data.guest); });
+                broadcastCadastre();
                 ws.send(JSON.stringify({ type: 'sys', msg: `${data.guest} a reçu les droits sur vos terrains.` }));
                 return;
             }
@@ -349,6 +356,7 @@ wss.on('connection', (ws) => {
                 if (overlap) return ws.send(JSON.stringify({ type: 'error', msg: 'Zone occupée.' }));
                 
                 dbRef.pix -= 100; cadastre.push(newZone);
+                broadcastCadastre(); // Actualise les terrains pour tout le monde
                 ws.send(JSON.stringify({ type: 'sys', msg: 'Terrain acquis ! Impôt : 5 Pix/j' }));
                 ws.send(JSON.stringify({ type: 'sync_stats', pix: dbRef.pix, inv: dbRef.inventory }));
                 return;
@@ -576,16 +584,19 @@ setInterval(() => {
     const now = Date.now();
     const deltas = [];
 
+    // IMPOT FONCIER
     if (now - lastHour > 86400000) { 
         lastHour = now;
+        let changed = false;
         cadastre = cadastre.filter(zone => {
             if (zone.type === 'heritage') return true; 
             const ownerRef = usersDb[zone.owner];
-            if (!ownerRef) return false;
+            if (!ownerRef) { changed = true; return false; }
             let tax = Math.ceil((zone.w * zone.h) * 0.05);
             if (ownerRef.pix >= tax) { ownerRef.pix -= tax; return true; } 
-            else return false; 
+            else { changed = true; return false; } 
         });
+        if (changed) broadcastCadastre(); // Si quelqu'un fait faillite, on actualise
     }
 
     for (let [coord, colorId] of pixelUpdates.entries()) {
@@ -888,6 +899,7 @@ const FRONTEND_HTML = `
         let offCtx = offCanvas.getContext('2d');
         
         let playersMap = [], colorDict = {}, avatarsDict = {}; 
+        let clientCadastre = []; // Stockage du cadastre côté client
         let currentAvatarEdit = [Array(25).fill(255), Array(25).fill(255), Array(25).fill(255)];
         let selectedAvatarColor = 20;
         let lastMovePacket = 0;
@@ -942,7 +954,7 @@ const FRONTEND_HTML = `
                 if (data.type === 'auth_success') {
                     document.getElementById('modal-login').classList.remove('show');
                     myUser = document.getElementById('inp-user').value.trim();
-                    colorDict = data.colors; avatarsDict = data.avatars;
+                    colorDict = data.colors; avatarsDict = data.avatars; clientCadastre = data.cadastre || [];
                     camX = data.state.x; camY = data.state.y;
                     updateHUD(data.state); buildPalette(); buildAvatarEditorUI();
                     
@@ -958,6 +970,7 @@ const FRONTEND_HTML = `
                 else if (data.type === 'error') notify(data.msg, true);
                 else if (data.type === 'sys') notify(data.msg);
                 else if (data.type === 'sync_stats') { updateHUD(data); if(data.vault) renderVault(data.inv, data.vault); }
+                else if (data.type === 'sync_cadastre') clientCadastre = data.cadastre; // Mise à jour dynamique des terrains
                 else if (data.type === 'alanstore_res') renderAlanStore(data.occ, data.prices);
                 else if (data.type === 'avatar_update') avatarsDict[data.u] = data.a;
                 else if (data.type === 'open_craft') document.getElementById('modal-craft').classList.add('show');
@@ -1182,6 +1195,20 @@ const FRONTEND_HTML = `
                 for(let j=-1; j<=1; j++) {
                     let bx = startX + i*BOARD_SIZE, by = startY + j*BOARD_SIZE;
                     ctx.drawImage(offCanvas, bx, by);
+                    
+                    // Rendu des zones privées (Cadastre)
+                    for (let z of clientCadastre) {
+                        const isMine = (z.owner === myUser || (z.guests && z.guests.includes(myUser)));
+                        const isHeritage = (z.type === 'heritage');
+                        
+                        ctx.fillStyle = isHeritage ? "rgba(241, 196, 15, 0.15)" : (isMine ? "rgba(46, 204, 113, 0.15)" : "rgba(231, 76, 60, 0.15)");
+                        ctx.fillRect(bx + z.x, by + z.y, z.w, z.h);
+                        ctx.strokeStyle = isHeritage ? "rgba(241, 196, 15, 0.5)" : (isMine ? "rgba(46, 204, 113, 0.5)" : "rgba(231, 76, 60, 0.5)");
+                        ctx.lineWidth = 0.5;
+                        ctx.strokeRect(bx + z.x, by + z.y, z.w, z.h);
+                    }
+
+                    // Rendu du Nexus
                     ctx.fillStyle = "rgba(0, 255, 255, 0.15)"; ctx.fillRect(bx + 475, by + 475, 50, 50);
                     ctx.strokeStyle = "rgba(0, 255, 255, 0.5)"; ctx.lineWidth = 1; ctx.strokeRect(bx + 475, by + 475, 50, 50);
                     ctx.fillStyle = "rgba(0, 255, 255, 0.9)"; ctx.font = '2.5px Arial'; ctx.textAlign = 'center';
