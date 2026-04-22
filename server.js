@@ -2,7 +2,7 @@
  * PIXEL PLANET - Serveur MMO Hardcore "Single-File"
  * Architecture : Node.js + ws
  * Contrainte : < 512 Mo RAM
- * Version : 1.7 (GDD Strict 100%, Corrections Clics, Animations et Économie)
+ * Version : 1.8 (Correction crash déco AlanStore + Suppression Compte)
  */
 
 const http = require('http');
@@ -66,7 +66,12 @@ function initFiles() {
     else { board = Buffer.alloc(BOARD_SIZE * BOARD_SIZE); board.fill(0); }
     try { if (fs.existsSync(USERS_FILE)) usersDb = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch(e) {}
     try { if (fs.existsSync(CADASTRE_FILE)) cadastre = JSON.parse(fs.readFileSync(CADASTRE_FILE, 'utf8')); } catch(e) {}
-    try { if (fs.existsSync(ALANSTORE_FILE)) alanStore = JSON.parse(fs.readFileSync(ALANSTORE_FILE, 'utf8')); } catch(e) {}
+    try { 
+        if (fs.existsSync(ALANSTORE_FILE)) {
+            const parsedStore = JSON.parse(fs.readFileSync(ALANSTORE_FILE, 'utf8'));
+            if (parsedStore.occasion) alanStore.occasion = parsedStore.occasion;
+        } 
+    } catch(e) {}
     try { if (fs.existsSync(SHOPS_FILE)) playerShops = JSON.parse(fs.readFileSync(SHOPS_FILE, 'utf8')); } catch(e) {}
 }
 initFiles();
@@ -140,7 +145,6 @@ const server = http.createServer((req, res) => {
 // --- 6. WEBSOCKET ---
 const wss = new WebSocketServer({ server });
 
-// PRIX ALAN STORE RÉVISÉS POUR ÉVITER LE SOFT-LOCK
 const ALANSTORE_PRICES = {
     'pioche': 50, 'graine': 10, 'graine_med': 20, 'munition': 5, 'arme': 1000, 
     'trousse_secours': 100, 'protection_pvp': 500, 'bloc_etabli': 50, 
@@ -164,7 +168,6 @@ wss.on('connection', (ws) => {
                 if (data.isRegister) {
                     if (usersDb[user]) return ws.send(JSON.stringify({ type: 'error', msg: 'Pseudo pris.' }));
                     const spawn = getRandomSpawn(data.spawnNexus);
-                    // Démarrage avec 200 Pix pour pouvoir acheter Pioche ET Établi !
                     usersDb[user] = { pass: hashedPass, pix: 200, hp: 100, stamina: 100, job: "chômeur", x: spawn.x, y: spawn.y, inventory: [], vault: [], avatar: DEFAULT_AVATAR, lastJobChange: 0, pvpProtectUntil: 0 };
                 } else {
                     if (!usersDb[user] || usersDb[user].pass !== hashedPass) return ws.send(JSON.stringify({ type: 'error', msg: 'Erreur login.' }));
@@ -187,6 +190,26 @@ wss.on('connection', (ws) => {
             const playerState = activePlayers.get(ws.id);
             const dbRef = usersDb[ws.user];
 
+            // SUPPRESSION COMPTE (GDD)
+            if (data.type === 'delete_account') {
+                if (dbRef) {
+                    if (!alanStore.occasion) alanStore.occasion = [];
+                    // Drop tout (sac + coffre) au marché de l'occasion
+                    if (dbRef.inventory && dbRef.inventory.length > 0) alanStore.occasion.push(...dbRef.inventory);
+                    if (dbRef.vault && dbRef.vault.length > 0) alanStore.occasion.push(...dbRef.vault);
+                    
+                    // Libère les terrains privés (deviennent des ruines publiques)
+                    cadastre = cadastre.filter(z => z.owner !== ws.user);
+                    
+                    delete usersDb[ws.user];
+                    activePlayers.delete(ws.id);
+                    ws.send(JSON.stringify({ type: 'sys', msg: 'Compte définitivement supprimé.' }));
+                    ws.close();
+                    saveFiles(); // Sauvegarde immédiate pour garantir la suppression
+                }
+                return;
+            }
+
             if (data.type === 'set_avatar') {
                 if(data.frames && data.frames.length === 3) {
                     dbRef.avatar = data.frames;
@@ -197,7 +220,6 @@ wss.on('connection', (ws) => {
 
             if (data.type === 'chat') {
                 const msg = data.msg.substring(0, 100); 
-                
                 if (msg.startsWith('/pay ')) {
                     const parts = msg.split(' '); const amount = parseInt(parts[2]); const target = parts[1];
                     if (usersDb[target] && amount > 0 && dbRef.pix >= amount) {
@@ -207,13 +229,11 @@ wss.on('connection', (ws) => {
                     } else ws.send(JSON.stringify({ type: 'error', msg: 'Paiement invalide ou fonds insuffisants.' }));
                     return;
                 }
-
                 if (msg.startsWith('/admin heritage') && ws.user === 'Admin') {
                     const zone = getZone(playerState.x, playerState.y);
                     if (zone) { zone.type = 'heritage'; ws.send(JSON.stringify({ type: 'sys', msg: 'Zone classée Patrimoine.' })); }
                     return;
                 }
-
                 if (data.channel === 'global') {
                     if (dbRef.pix < 5) return ws.send(JSON.stringify({ type: 'error', msg: 'Fonds insuffisants (5 Pix).' }));
                     dbRef.pix -= 5; ws.send(JSON.stringify({ type: 'sync_stats', pix: dbRef.pix }));
@@ -237,7 +257,6 @@ wss.on('connection', (ws) => {
                 dbRef.x = playerState.x; dbRef.y = playerState.y;
             }
 
-            // GESTION METIER (Détachée des clics souris pour fonctionner partout)
             if (data.type === 'change_job') {
                 if (!isNexus(playerState.x, playerState.y)) return ws.send(JSON.stringify({ type: 'error', msg: 'Vous devez être dans le Nexus (Zone Bleue).' }));
                 if (Date.now() - (dbRef.lastJobChange || 0) < 300000) return ws.send(JSON.stringify({ type: 'error', msg: 'Délai de 5 minutes requis entre chaque changement.' }));
@@ -251,8 +270,6 @@ wss.on('connection', (ws) => {
             if (data.type === 'use_item') {
                 if (data.action === 'place') {
                     if (!canModify(ws.user, playerState.x, playerState.y)) return ws.send(JSON.stringify({ type: 'error', msg: 'Terrain Protégé.' }));
-                    
-                    // GDD: Coffre et Magasin uniquement sur terrain personnel
                     if (data.item === 'bloc_coffre' || data.item === 'bloc_magasin') {
                         const zone = getZone(playerState.x, playerState.y);
                         if (!zone || zone.owner !== ws.user) return ws.send(JSON.stringify({ type: 'error', msg: 'Posable UNIQUEMENT sur VOTRE terrain privé.' }));
@@ -363,7 +380,6 @@ wss.on('connection', (ws) => {
 
             // INTERACTION SOURIS (MAP)
             if (data.type === 'interact') {
-                // Arrondi pour éviter les index flottants
                 const tx = Math.floor(wrap(data.x, BOARD_SIZE)), ty = Math.floor(wrap(data.y, BOARD_SIZE));
                 if (toroidalDist(playerState.x, playerState.y, tx, ty) > 25) return; 
                 const idx = getIndex(tx, ty), targetId = board[idx];
@@ -375,12 +391,11 @@ wss.on('connection', (ws) => {
 
                 if (data.action === 'interact') {
                     if (targetId === 12 && dbRef.job === 'concessionnaire') {
-                        // GDD 9.1: ALGORITHME FLOOD FILL MAX
                         const engineIdx = dbRef.inventory.findIndex(i => i.id === 'moteur');
                         if (engineIdx === -1) return ws.send(JSON.stringify({ type: 'error', msg: 'Moteur requis dans l\'inventaire.' }));
                         const engine = dbRef.inventory[engineIdx];
                         
-                        let limit = 225; // Voiture
+                        let limit = 225; 
                         if (engine.mtype === 'Camion') limit = 1500;
                         if (engine.mtype === 'Train') limit = 1000;
                         if (engine.mtype === 'Tracteur') limit = 100;
@@ -422,11 +437,10 @@ wss.on('connection', (ws) => {
                 if (dbRef.stamina < 1) return ws.send(JSON.stringify({ type: 'error', msg: 'Épuisé. Mangez ou reposez-vous.' }));
 
                 if (data.action === 'mine' && dbRef.job === 'ouvrier') {
-                    // GDD: Verification Pioche
                     const pioche = dbRef.inventory.find(i => i.id === 'pioche');
-                    if (!pioche) return ws.send(JSON.stringify({ type: 'error', msg: 'Il vous faut une pioche (AlanStore).' }));
+                    if (!pioche) return ws.send(JSON.stringify({ type: 'error', msg: 'Il vous faut une Pioche ! Achetez-la dans l\'AlanStore.' }));
 
-                    if (targetId === 5) { // Minage Instantané & Speed boost
+                    if (targetId === 5) { 
                         pixelUpdates.set(`${tx},${ty}`, 0); dbRef.stamina -= 1; giveItem(ws.user, 'inventory', 'pixelium', 1);
                         ws.send(JSON.stringify({ type: 'sys', msg: '+1 Pixelium' }));
                     } 
@@ -443,7 +457,6 @@ wss.on('connection', (ws) => {
                     if (dbRef.job !== 'bâtisseur' && dbRef.job !== 'vendeur') return ws.send(JSON.stringify({ type: 'error', msg: 'Métier inadapté.' }));
                     if (!canModify(ws.user, tx, ty)) return ws.send(JSON.stringify({ type: 'error', msg: 'Terrain Protégé.' }));
                     
-                    // GDD: Bloc Peinture Enforced
                     const baseColors = [0, 1, 2, 20, 30, 255]; 
                     if (!baseColors.includes(data.colorId)) {
                         if (!dbRef.inventory.find(i => i.id === 'bloc_peinture')) return ws.send(JSON.stringify({ type: 'error', msg: 'Bloc Peinture requis (AlanStore).' }));
@@ -475,8 +488,6 @@ wss.on('connection', (ws) => {
                 }
                 else if (data.action === 'shoot') {
                     if (dbRef.job !== 'guerrier') return ws.send(JSON.stringify({ type: 'error', msg: 'Seul un Guerrier tire.' }));
-                    
-                    // GDD: Arme & Munitions Enforced
                     if (!dbRef.inventory.find(i => i.id === 'arme')) return ws.send(JSON.stringify({ type: 'error', msg: 'Arme requise (AlanStore).' }));
                     if (!consumeItem(ws.user, 'inventory', 'munition', 1)) return ws.send(JSON.stringify({ type: 'error', msg: 'Munitions requises.' }));
                     
@@ -489,9 +500,10 @@ wss.on('connection', (ws) => {
                             
                             targetDb.hp -= ostate.isDriving ? 10 : 20; 
                             if (targetDb.hp <= 0) {
+                                if (!alanStore.occasion) alanStore.occasion = [];
                                 if (targetDb.inventory.length > 0) alanStore.occasion.push(...targetDb.inventory);
                                 targetDb.inventory = []; targetDb.hp = 100;
-                                const rsp = getRandomSpawn(true); // GDD: Respawn Forcé au Nexus
+                                const rsp = getRandomSpawn(true);
                                 targetDb.x = rsp.x; targetDb.y = rsp.y;
                                 ostate.x = rsp.x; ostate.y = rsp.y; ostate.isDriving = null;
                                 ws.send(JSON.stringify({ type: 'sys', msg: `Kill: ${ostate.user}` }));
@@ -503,7 +515,7 @@ wss.on('connection', (ws) => {
                 ws.send(JSON.stringify({ type: 'sync_stats', hp: dbRef.hp, stamina: dbRef.stamina, inv: dbRef.inventory }));
             }
             
-            if (data.type === 'alanstore_req') { ws.send(JSON.stringify({ type: 'alanstore_res', occ: alanStore.occasion, prices: ALANSTORE_PRICES })); return; }
+            if (data.type === 'alanstore_req') { ws.send(JSON.stringify({ type: 'alanstore_res', occ: alanStore.occasion || [], prices: ALANSTORE_PRICES })); return; }
             if (data.type === 'alanstore_buy_sys') {
                 const cost = ALANSTORE_PRICES[data.item];
                 if (cost && dbRef.pix >= cost) {
@@ -519,12 +531,12 @@ wss.on('connection', (ws) => {
 
                     giveItem(ws.user, 'inventory', data.item, 1, props);
                     ws.send(JSON.stringify({ type: 'sync_stats', pix: dbRef.pix, inv: dbRef.inventory, job: dbRef.job }));
-                    ws.send(JSON.stringify({ type: 'alanstore_res', occ: alanStore.occasion, prices: ALANSTORE_PRICES })); 
+                    ws.send(JSON.stringify({ type: 'alanstore_res', occ: alanStore.occasion || [], prices: ALANSTORE_PRICES })); 
                 } else ws.send(JSON.stringify({ type: 'error', msg: 'Fonds insuffisants.' }));
             }
             if (data.type === 'alanstore_buy_occ') {
                 const idx = data.index, occPrice = 50; 
-                if (alanStore.occasion[idx] && dbRef.pix >= occPrice) {
+                if (alanStore.occasion && alanStore.occasion[idx] && dbRef.pix >= occPrice) {
                     const item = alanStore.occasion[idx]; dbRef.pix -= occPrice; alanStore.occasion.splice(idx, 1); 
                     giveItem(ws.user, 'inventory', item.id, item.qty, item);
                     ws.send(JSON.stringify({ type: 'sync_stats', pix: dbRef.pix, inv: dbRef.inventory }));
@@ -536,18 +548,29 @@ wss.on('connection', (ws) => {
     });
 
     ws.on('close', () => { 
-        if (ws.user) {
-            const dbRef = usersDb[ws.user];
-            const pState = activePlayers.get(ws.id);
-            if (dbRef && dbRef.inventory.length > 0) {
-                if (!isInOwnBase(ws.user, pState.x, pState.y)) {
-                    alanStore.occasion.push(...dbRef.inventory); 
-                    dbRef.inventory = [];
+        try {
+            if (ws.user) {
+                const dbRef = usersDb[ws.user];
+                const pState = activePlayers.get(ws.id);
+                if (dbRef && dbRef.inventory && dbRef.inventory.length > 0) {
+                    let safeInBase = false;
+                    if (pState) {
+                        const zone = getZone(pState.x, pState.y);
+                        if (zone && (zone.owner === ws.user || zone.guests.includes(ws.user))) safeInBase = true;
+                    }
+                    // Saisie Hardcore si déco sauvage
+                    if (!safeInBase) {
+                        if (!alanStore.occasion) alanStore.occasion = [];
+                        alanStore.occasion.push(...dbRef.inventory); 
+                        dbRef.inventory = [];
+                        console.log(`[OCCASION] Inventaire de ${ws.user} saisi (Déco hors-base).`);
+                    }
                 }
+                if (pState) pState.isDriving = null;
+                activePlayers.delete(ws.id); 
+                saveFiles(); 
             }
-            if (pState) pState.isDriving = null;
-            activePlayers.delete(ws.id); 
-        }
+        } catch(e) { console.error("Erreur deconnexion", e); }
     });
 });
 
@@ -559,7 +582,7 @@ setInterval(() => {
     const now = Date.now();
     const deltas = [];
 
-    // IMPOT FONCIER (Calcul exact)
+    // IMPOT FONCIER
     if (now - lastHour > 86400000) { 
         lastHour = now;
         cadastre = cadastre.filter(zone => {
@@ -582,9 +605,8 @@ setInterval(() => {
     const tickMin = (now - lastMin > 60000);
     if (tickMin) lastMin = now;
 
-    // GDD: Agriculture
     activeCrops.forEach((crop, coord) => {
-        if (now - crop.plantedAt > 900000) { // 15 mins exacts
+        if (now - crop.plantedAt > 900000) { 
             const [cx, cy] = coord.split(',');
             if (board[getIndex(cx, cy)] === 6) pixelUpdates.set(coord, 4); 
             if (board[getIndex(cx, cy)] === 7) pixelUpdates.set(coord, 8); 
@@ -608,10 +630,7 @@ setInterval(() => {
         if (board[getIndex(rx, ry)] === 0 && !isNexus(rx, ry)) pixelUpdates.set(`${rx},${ry}`, 5); 
     }
 
-    // GDD: Validation du Mouvement pour Animation 
-    for (let [id, p] of activePlayers.entries()) {
-        if (now - p.lastMove > 150) p.moving = false; // Coupe l'animation
-    }
+    for (let [id, p] of activePlayers.entries()) { if (now - p.lastMove > 150) p.moving = false; }
 
     const playersData = Array.from(activePlayers.values()).map(p => ({ u: p.user, x: p.x, y: p.y, d: p.isDriving ? p.isDriving.mtype : null, m: p.moving, f: p.facing }));
     const broadcastMsg = JSON.stringify({ type: 'tick', p: playersData, d: deltas });
@@ -668,7 +687,7 @@ const FRONTEND_HTML = `
         .modal h2 { margin-top: 0; color: #f39c12; border-bottom: 1px solid #444; padding-bottom: 10px; }
         .modal .btn { width: 100%; margin-bottom: 10px; }
         
-        #modal-store, #modal-avatar, #modal-vault, #modal-shop, #modal-craft, #modal-entreprise, #modal-casse { width: 600px; }
+        #modal-store, #modal-avatar, #modal-vault, #modal-shop, #modal-craft, #modal-entreprise, #modal-casse, #modal-account { width: 600px; }
         .store-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; text-align: left; }
         .store-section { background: #111; padding: 15px; border-radius: 8px; border: 1px solid #333; max-height: 250px; overflow-y: auto;}
         .store-item { display: flex; justify-content: space-between; margin-bottom: 10px; align-items: center; font-size: 12px; border-bottom: 1px solid #222; padding-bottom: 5px; }
@@ -719,7 +738,7 @@ const FRONTEND_HTML = `
         </div>
 
         <div id="inv-container">
-            <h4 style="margin:0 0 10px 0; color:#f39c12;">Sac (Perdu si Mort)</h4>
+            <h4 style="margin:0 0 10px 0; color:#f39c12;">Sac (Perdu si Mort/Déco)</h4>
             <div id="inv-list"></div>
         </div>
 
@@ -728,6 +747,7 @@ const FRONTEND_HTML = `
         <div class="bottom-bar">
             <button class="btn" onclick="openAvatarEditor()" style="background:#2980b9; width:auto; margin:0">🎨 Studio Avatar</button>
             <button class="btn" onclick="document.getElementById('modal-nexus').classList.add('show')" style="width:auto; margin:0">Nexus (Métiers)</button>
+            <button class="btn" onclick="document.getElementById('acc-username').innerText = myUser; document.getElementById('modal-account').classList.add('show')" style="background:#c0392b; width:auto; margin:0">⚙️ Compte</button>
         </div>
     </div>
 
@@ -744,6 +764,26 @@ const FRONTEND_HTML = `
         </div>
         <button class="btn" id="btn-login" onclick="auth(false)" disabled>1. Chargement Map...</button>
         <button class="btn" id="btn-reg" onclick="auth(true)" style="background: #8e44ad;" disabled>Patientez...</button>
+    </div>
+
+    <!-- MODAL COMPTE (SUPPRESSION) -->
+    <div class="modal" id="modal-account" style="width: 400px;">
+        <h2>Paramètres du Compte</h2>
+        <p>Connecté en tant que : <b id="acc-username" style="color:#3498db"></b></p>
+        <p style="font-size:12px; color:#aaa; margin-bottom:20px;">Vos données, terrains et coffres sont liés à ce pseudo.</p>
+        
+        <div style="border-top:1px solid #444; padding-top:15px;">
+            <p style="color:#e74c3c; font-size:12px; font-weight:bold;">Zone Dangereuse</p>
+            <button class="btn" id="btn-init-delete" style="background:#e67e22; width:100%" onclick="document.getElementById('delete-confirm-step').style.display='block'; this.style.display='none';">Supprimer mon compte</button>
+            
+            <div id="delete-confirm-step" style="display:none; margin-top: 10px; background:#2c0000; padding:10px; border-radius:5px; border:1px solid #e74c3c;">
+                <p style="color:#e74c3c; font-weight:bold; margin-top:0">Êtes-vous SÛR ?</p>
+                <p style="font-size:11px; color:#ccc;">Vos terrains redeviendront publics et tout votre inventaire/coffre ira aux Occasions.</p>
+                <button class="btn" style="background:#c0392b; width:100%" onclick="ws.send(JSON.stringify({ type: 'delete_account' })); document.getElementById('modal-account').classList.remove('show');">OUI, SUPPRIMER DÉFINITIVEMENT</button>
+            </div>
+        </div>
+        <br>
+        <button class="btn" style="background:#555; width:100%" onclick="document.getElementById('modal-account').classList.remove('show'); document.getElementById('delete-confirm-step').style.display='none'; document.getElementById('btn-init-delete').style.display='block';">Fermer</button>
     </div>
 
     <!-- MODAL NEXUS -->
@@ -850,7 +890,7 @@ const FRONTEND_HTML = `
         let currentAvatarEdit = [Array(25).fill(255), Array(25).fill(255), Array(25).fill(255)];
         let selectedAvatarColor = 20;
         let lastMovePacket = 0;
-        let colorCache = new Uint32Array(256); // Cache global des couleurs pour la minimap
+        let colorCache = new Uint32Array(256); 
         
         const keys = { w:false, a:false, s:false, d:false, z:false, q:false, arrowup:false, arrowdown:false, arrowleft:false, arrowright:false };
         let facingRight = true;
@@ -943,6 +983,16 @@ const FRONTEND_HTML = `
                     const me = playersMap.find(p => p.u === myUser);
                     if (me) isDriving = me.d;
                 }
+            };
+            
+            ws.onclose = () => {
+                document.getElementById('ui-layer').style.display = 'none';
+                document.getElementById('modal-login').classList.add('show');
+                document.getElementById('btn-login').disabled = true;
+                document.getElementById('btn-reg').disabled = true;
+                document.getElementById('btn-login').innerText = "Déconnecté (Veuillez rafraîchir la page)";
+                document.getElementById('btn-reg').innerText = "Déconnecté";
+                myUser = null;
             };
         }
 
@@ -1205,7 +1255,6 @@ const FRONTEND_HTML = `
             }
             mCtx.putImageData(imgData, 0, 0);
             
-            // Dessiner la position actuelle du joueur en rouge
             mCtx.fillStyle = 'red';
             mCtx.beginPath();
             mCtx.arc(wrap(camX, BOARD_SIZE), wrap(camY, BOARD_SIZE), 10, 0, Math.PI * 2);
