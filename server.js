@@ -167,7 +167,7 @@ wss.on('connection', (ws) => {
                 if (!usersDb[user].vault) usersDb[user].vault = [];
 
                 ws.user = user;
-                activePlayers.set(ws.id, { user, x: usersDb[user].x, y: usersDb[user].y, isDriving: null, lastMove: 0, facing: 1, moving: false, mineTicks: 0 });
+                activePlayers.set(ws.id, { user, x: usersDb[user].x, y: usersDb[user].y, isDriving: null, lastMove: 0, facing: 1, moving: false });
 
                 const allAvatars = {};
                 for (let u in usersDb) allAvatars[u] = usersDb[u].avatar;
@@ -333,7 +333,7 @@ wss.on('connection', (ws) => {
 
             if (data.type === 'interact') {
                 const tx = wrap(data.x, BOARD_SIZE), ty = wrap(data.y, BOARD_SIZE);
-                if (toroidalDist(playerState.x, playerState.y, tx, ty) > 15) return; 
+                if (toroidalDist(playerState.x, playerState.y, tx, ty) > 25) return; // Portée de clic grandement augmentée pour la souris
                 const idx = getIndex(tx, ty), targetId = board[idx];
 
                 if (isNexus(tx, ty)) {
@@ -384,12 +384,9 @@ wss.on('connection', (ws) => {
                 if (dbRef.stamina < 1) return ws.send(JSON.stringify({ type: 'error', msg: 'Épuisé. Mangez ou reposez-vous.' }));
 
                 if (data.action === 'mine' && dbRef.job === 'ouvrier') {
-                    if (targetId === 5) { // MINAGE PROLONGE OUVRIER (GDD 7.2)
-                        playerState.mineTicks++;
-                        if (playerState.mineTicks >= 4) { // 4 requêtes consécutives requises
-                            pixelUpdates.set(`${tx},${ty}`, 0); dbRef.stamina -= 1; giveItem(ws.user, 'inventory', 'pixelium', 1);
-                            playerState.mineTicks = 0; ws.send(JSON.stringify({ type: 'sys', msg: '+1 Pixelium' }));
-                        }
+                    if (targetId === 5) { // MINAGE INSTANTANÉ (UX Corrigée)
+                        pixelUpdates.set(`${tx},${ty}`, 0); dbRef.stamina -= 1; giveItem(ws.user, 'inventory', 'pixelium', 1);
+                        ws.send(JSON.stringify({ type: 'sys', msg: '+1 Pixelium' }));
                     } 
                     else if (targetId >= 20) { // DEMANTELEMENT DES RUINES (GDD 8.2)
                         const zone = getZone(tx, ty);
@@ -675,7 +672,7 @@ const FRONTEND_HTML = `
 
         <div class="bottom-bar">
             <button class="btn" onclick="openAvatarEditor()" style="background:#2980b9; width:auto; margin:0">🎨 Studio Avatar</button>
-            <button class="btn" id="btn-interact" style="background:#8e44ad; width:auto; margin:0">Interagir (Maintien ou Clic)</button>
+            <button class="btn" onclick="document.getElementById('modal-nexus').classList.add('show')" style="width:auto; margin:0">Nexus (Métiers)</button>
         </div>
     </div>
 
@@ -934,6 +931,7 @@ const FRONTEND_HTML = `
 
         canvas.addEventListener('mousemove', (e) => { lastMouseX = e.clientX; lastMouseY = e.clientY; });
         canvas.addEventListener('mousedown', (e) => { 
+            if (e.target !== canvas) return; // Empêche de cliquer à travers l'interface (UI)
             isMouseDown = true; lastMouseX = e.clientX; lastMouseY = e.clientY; handleInteract(); 
             interactInterval = setInterval(() => { if (isMouseDown) handleInteract(); }, 200); 
         });
@@ -941,17 +939,28 @@ const FRONTEND_HTML = `
 
         function handleInteract() {
             if (!myUser) return;
+            const rect = canvas.getBoundingClientRect();
             const cx = canvas.width / 2, cy = canvas.height / 2;
-            const worldX = Math.floor(camX + (lastMouseX - canvas.getBoundingClientRect().left - cx) / scale);
-            const worldY = Math.floor(camY + (lastMouseY - canvas.getBoundingClientRect().top - cy) / scale);
+            const worldX = Math.floor(camX + (lastMouseX - rect.left - cx) / scale);
+            const worldY = Math.floor(camY + (lastMouseY - rect.top - cy) / scale);
 
-            let action = 'interact';
-            if (myJob === 'ouvrier') action = 'mine';
-            if (myJob === 'bâtisseur' || myJob === 'vendeur') action = 'build';
-            if (myJob === 'fermier') action = 'plant'; 
-            if (myJob === 'guerrier') action = 'shoot';
+            const wrappedX = wrap(worldX, BOARD_SIZE);
+            const wrappedY = wrap(worldY, BOARD_SIZE);
+            const targetId = clientBoard[getIndex(wrappedX, wrappedY)];
 
-            ws.send(JSON.stringify({ type: 'interact', x: wrap(worldX, BOARD_SIZE), y: wrap(worldY, BOARD_SIZE), action, colorId: selectedColorId }));
+            let action = 'interact'; // Clic intelligent selon la cible !
+            if (myJob === 'ouvrier') {
+                if (targetId === 5 || targetId === 15 || targetId >= 20) action = 'mine';
+                else if (targetId === 10) action = 'craft';
+            }
+            else if (myJob === 'bâtisseur' || myJob === 'vendeur') action = 'build';
+            else if (myJob === 'fermier') {
+                if (targetId === 1) action = 'plant';
+                else if (targetId === 4 || targetId === 8) action = 'harvest';
+            }
+            else if (myJob === 'guerrier') action = 'shoot';
+
+            ws.send(JSON.stringify({ type: 'interact', x: wrappedX, y: wrappedY, action, colorId: selectedColorId }));
         }
 
         let lastTime = performance.now();
