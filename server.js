@@ -40,6 +40,7 @@ const COLORS = {
     14: '#2F4F4F', // Coffre-fort
     15: '#8B0000', // Casse
     16: '#00CED1', // Entreprise
+    17: '#8e44ad', // Bloc Carte (Minimap)
     20: '#D2B48C', 21: '#E63946', 22: '#4CC9F0', 23: '#06D6A0', 24: '#FFD166', 25: '#8338EC', 26: '#FF99C8', // Bois
     30: '#A9A9A9', 31: '#A02831', 32: '#308099', 33: '#048C68', 34: '#B39247', 35: '#532396', 36: '#B36B8C'  // Pierre
 };
@@ -91,7 +92,10 @@ function toroidalDist(x1, y1, x2, y2) {
 // --- 4. MÉCANIQUES ---
 function hashPassword(password) { return crypto.scryptSync(password, "PixelPlanetSalt2026", 64).toString('hex'); }
 function isNexus(x, y) { return (x >= 475 && x < 525 && y >= 475 && y < 525); }
-function getRandomSpawn() { return { x: 500 + Math.floor(Math.random() * 10 - 5), y: 500 + Math.floor(Math.random() * 10 - 5) }; }
+function getRandomSpawn(inNexus) { 
+    if (inNexus) return { x: 500 + Math.floor(Math.random() * 20 - 10), y: 500 + Math.floor(Math.random() * 20 - 10) };
+    return { x: Math.floor(Math.random() * BOARD_SIZE), y: Math.floor(Math.random() * BOARD_SIZE) }; 
+}
 
 function getZone(x, y) { return cadastre.find(z => x >= z.x && x < z.x + z.w && y >= z.y && y < z.y + z.h); }
 function canModify(username, x, y) {
@@ -140,7 +144,7 @@ const wss = new WebSocketServer({ server });
 const ALANSTORE_PRICES = {
     'pioche': 50, 'graine': 10, 'graine_med': 20, 'munition': 5, 'arme': 1000, 
     'trousse_secours': 100, 'protection_pvp': 500, 'bloc_etabli': 200, 
-    'bloc_peinture': 300, 'bloc_magasin': 500, 'moteur': 800, 
+    'bloc_peinture': 300, 'bloc_magasin': 500, 'bloc_carte': 5000, 'moteur': 800, 
     'bloc_garage': 800, 'bloc_coffre': 1000, 'bloc_casse': 500, 'bloc_entreprise': 2000 
 };
 
@@ -159,7 +163,7 @@ wss.on('connection', (ws) => {
 
                 if (data.isRegister) {
                     if (usersDb[user]) return ws.send(JSON.stringify({ type: 'error', msg: 'Pseudo pris.' }));
-                    const spawn = getRandomSpawn();
+                    const spawn = getRandomSpawn(data.spawnNexus);
                     usersDb[user] = { pass: hashedPass, pix: 100, hp: 100, stamina: 100, job: "chômeur", x: spawn.x, y: spawn.y, inventory: [], vault: [], avatar: DEFAULT_AVATAR, lastJobChange: 0, pvpProtectUntil: 0 };
                 } else {
                     if (!usersDb[user] || usersDb[user].pass !== hashedPass) return ws.send(JSON.stringify({ type: 'error', msg: 'Erreur login.' }));
@@ -253,7 +257,7 @@ wss.on('connection', (ws) => {
                         if (!zone || zone.owner !== ws.user) return ws.send(JSON.stringify({ type: 'error', msg: 'Posable UNIQUEMENT sur VOTRE terrain privé.' }));
                     }
 
-                    const blockIds = { 'bloc_etabli': 10, 'bloc_garage': 12, 'bloc_magasin': 13, 'bloc_coffre': 14, 'bloc_casse': 15, 'bloc_entreprise': 16 };
+                    const blockIds = { 'bloc_etabli': 10, 'bloc_garage': 12, 'bloc_magasin': 13, 'bloc_coffre': 14, 'bloc_casse': 15, 'bloc_entreprise': 16, 'bloc_carte': 17 };
                     const bid = blockIds[data.item];
                     if (bid && consumeItem(ws.user, 'inventory', data.item, 1)) {
                         pixelUpdates.set(`${Math.floor(playerState.x)},${Math.floor(playerState.y)}`, bid);
@@ -399,6 +403,7 @@ wss.on('connection', (ws) => {
                     }
                     if (targetId === 10 && dbRef.job === 'ouvrier') return ws.send(JSON.stringify({ type: 'open_craft' }));
                     if (targetId === 16) return ws.send(JSON.stringify({ type: 'open_enterprise' }));
+                    if (targetId === 17) return ws.send(JSON.stringify({ type: 'open_map' }));
                     if (targetId === 15) return ws.send(JSON.stringify({ type: 'open_casse' }));
                     if (targetId === 14) { 
                         if (!canModify(ws.user, tx, ty)) return ws.send(JSON.stringify({ type: 'error', msg: 'Ce coffre n\'est pas à vous.' }));
@@ -717,6 +722,8 @@ const FRONTEND_HTML = `
             <div id="inv-list"></div>
         </div>
 
+        <div id="coords-display" style="position: absolute; bottom: 20px; right: 20px; font-family: monospace; color: rgba(255,255,255,0.7); pointer-events: none; z-index: 20; text-shadow: 1px 1px 2px #000;">X: 0 | Y: 0</div>
+
         <div class="bottom-bar">
             <button class="btn" onclick="openAvatarEditor()" style="background:#2980b9; width:auto; margin:0">🎨 Studio Avatar</button>
             <button class="btn" onclick="document.getElementById('modal-nexus').classList.add('show')" style="width:auto; margin:0">Nexus (Métiers)</button>
@@ -729,6 +736,11 @@ const FRONTEND_HTML = `
         <p>Le MMO Hardcore 512 Mo.</p>
         <input type="text" id="inp-user" placeholder="Pseudonyme (Min 3 char)">
         <input type="password" id="inp-pass" placeholder="Mot de passe">
+        <div style="margin: 15px 0; text-align: left;">
+            <label style="font-size: 12px; cursor: pointer; color: #ccc;">
+                <input type="checkbox" id="inp-nexus-spawn" checked> Apparaître au Nexus (Zone Sûre)
+            </label>
+        </div>
         <button class="btn" id="btn-login" onclick="auth(false)" disabled>1. Chargement Map...</button>
         <button class="btn" id="btn-reg" onclick="auth(true)" style="background: #8e44ad;" disabled>Patientez...</button>
     </div>
@@ -777,6 +789,15 @@ const FRONTEND_HTML = `
         <input type="text" id="inp-guest" placeholder="Pseudonyme du Guest">
         <button class="btn" onclick="ws.send(JSON.stringify({ type: 'add_guest', guest: document.getElementById('inp-guest').value.trim() })); document.getElementById('modal-entreprise').classList.remove('show')">Ajouter aux Droits</button>
         <button class="btn" style="background:#555" onclick="document.getElementById('modal-entreprise').classList.remove('show')">Fermer</button>
+    </div>
+
+    <div class="modal" id="modal-map" style="width: 500px;">
+        <h2>Carte du Monde</h2>
+        <p style="font-size:12px; color:#aaa;">Flux satellite en direct</p>
+        <div style="background:#000; border:1px solid #444; width:400px; height:400px; margin:0 auto; position: relative;">
+            <canvas id="minimap-canvas" width="1000" height="1000" style="width:100%; height:100%;"></canvas>
+        </div>
+        <button class="btn" style="background:#555; margin-top: 15px;" onclick="document.getElementById('modal-map').classList.remove('show')">Fermer</button>
     </div>
 
     <div class="modal" id="modal-casse">
@@ -828,6 +849,7 @@ const FRONTEND_HTML = `
         let currentAvatarEdit = [Array(25).fill(255), Array(25).fill(255), Array(25).fill(255)];
         let selectedAvatarColor = 20;
         let lastMovePacket = 0;
+        let colorCache = new Uint32Array(256); // Cache global des couleurs pour la minimap
         
         const keys = { w:false, a:false, s:false, d:false, z:false, q:false, arrowup:false, arrowdown:false, arrowleft:false, arrowright:false };
         let facingRight = true;
@@ -882,7 +904,6 @@ const FRONTEND_HTML = `
                     camX = data.state.x; camY = data.state.y;
                     updateHUD(data.state); buildPalette(); buildAvatarEditorUI();
                     
-                    const colorCache = new Uint32Array(256);
                     for (let key in colorDict) {
                         const hex = colorDict[key];
                         colorCache[key] = (255 << 24) | (parseInt(hex.slice(5,7),16) << 16) | (parseInt(hex.slice(3,5),16) << 8) | parseInt(hex.slice(1,3),16);
@@ -899,6 +920,7 @@ const FRONTEND_HTML = `
                 else if (data.type === 'avatar_update') avatarsDict[data.u] = data.a;
                 else if (data.type === 'open_craft') document.getElementById('modal-craft').classList.add('show');
                 else if (data.type === 'open_enterprise') document.getElementById('modal-entreprise').classList.add('show');
+                else if (data.type === 'open_map') openMapModal();
                 else if (data.type === 'open_vault') { renderVault(data.inv || [], data.vault); document.getElementById('modal-vault').classList.add('show'); }
                 else if (data.type === 'manage_shop') { currentShopCoord = data.coord; renderManageShop(data.shop); document.getElementById('modal-shop').classList.add('show'); }
                 else if (data.type === 'view_shop') { currentShopCoord = data.coord; renderViewShop(data.shop); document.getElementById('modal-shop').classList.add('show'); }
@@ -923,7 +945,10 @@ const FRONTEND_HTML = `
             };
         }
 
-        function auth(isReg) { ws.send(JSON.stringify({ type: 'auth', user: document.getElementById('inp-user').value.trim(), pass: document.getElementById('inp-pass').value, isRegister: isReg })); }
+        function auth(isReg) { 
+            const spawnNexus = document.getElementById('inp-nexus-spawn').checked;
+            ws.send(JSON.stringify({ type: 'auth', user: document.getElementById('inp-user').value.trim(), pass: document.getElementById('inp-pass').value, isRegister: isReg, spawnNexus: spawnNexus })); 
+        }
         function sendChat() { const inp = document.getElementById('chat-input'); if (inp.value.trim() !== '') { ws.send(JSON.stringify({ type: 'chat', channel: chatMode, msg: inp.value.trim() })); inp.value = ''; } }
         function changeJob(job) { ws.send(JSON.stringify({ type: 'change_job', job: job })); document.getElementById('modal-nexus').classList.remove('show'); }
 
@@ -1026,6 +1051,8 @@ const FRONTEND_HTML = `
             lastTime = time;
             if (!myUser) return;
 
+            document.getElementById('coords-display').innerText = `X: ${Math.floor(wrap(camX, BOARD_SIZE))} | Y: ${Math.floor(wrap(camY, BOARD_SIZE))}`;
+
             let baseSpeed = 10; 
             const pxColorId = clientBoard[getIndex(Math.floor(wrap(camX, BOARD_SIZE)), Math.floor(wrap(camY, BOARD_SIZE)))];
             
@@ -1101,7 +1128,14 @@ const FRONTEND_HTML = `
 
         function renderAlanStore(occasionData, prices) {
             const sysList = document.getElementById('sys-store-list');
-            const items = [{id:'pioche',n:'Pioche'},{id:'moteur',n:'Moteur'},{id:'arme',n:'Arme'},{id:'munition',n:'Balle (x1)'},{id:'graine',n:'Graines'},{id:'graine_med',n:'Graines Médicinales'},{id:'trousse_secours',n:'Trousse Secours'},{id:'protection_pvp',n:'Bouclier PvP'},{id:'bloc_etabli',n:'Établi'},{id:'bloc_peinture',n:'Peinture'},{id:'bloc_garage',n:'Garage'},{id:'bloc_magasin',n:'Magasin'},{id:'bloc_coffre',n:'Coffre'},{id:'bloc_casse',n:'Casse'},{id:'bloc_entreprise',n:'Entreprise'}];
+            const items = [
+                {id:'pioche',n:'Pioche'},{id:'moteur',n:'Moteur'},{id:'arme',n:'Arme'},
+                {id:'munition',n:'Balle (x1)'},{id:'graine',n:'Graines'},{id:'graine_med',n:'Graines Médicinales'},
+                {id:'trousse_secours',n:'Trousse Secours'},{id:'protection_pvp',n:'Bouclier PvP'},
+                {id:'bloc_etabli',n:'Établi'},{id:'bloc_peinture',n:'Peinture'},{id:'bloc_carte',n:'Carte du Monde'},
+                {id:'bloc_garage',n:'Garage'},{id:'bloc_magasin',n:'Magasin'},{id:'bloc_coffre',n:'Coffre'},
+                {id:'bloc_casse',n:'Casse'},{id:'bloc_entreprise',n:'Entreprise'}
+            ];
             sysList.innerHTML = items.map(i => \`<div class="store-item"><span>\${i.n}</span><button class="inv-btn" onclick="ws.send(JSON.stringify({ type: 'alanstore_buy_sys', item: '\${i.id}' }));">\${prices[i.id]} Pix</button></div>\`).join('');
             const occList = document.getElementById('occasion-list');
             if (occasionData.length === 0) occList.innerHTML = "<p style='font-size:12px;color:#888'>Aucun butin saisi.</p>";
@@ -1158,6 +1192,24 @@ const FRONTEND_HTML = `
         }
 
         function saveAvatar() { ws.send(JSON.stringify({ type: 'set_avatar', frames: currentAvatarEdit })); document.getElementById('modal-avatar').classList.remove('show'); }
+
+        function openMapModal() {
+            document.getElementById('modal-map').classList.add('show');
+            const mCanvas = document.getElementById('minimap-canvas');
+            const mCtx = mCanvas.getContext('2d');
+            const imgData = mCtx.createImageData(BOARD_SIZE, BOARD_SIZE);
+            const buf32 = new Uint32Array(imgData.data.buffer);
+            for (let i = 0; i < clientBoard.length; i++) {
+                buf32[i] = colorCache[clientBoard[i]] || 0xFF000000;
+            }
+            mCtx.putImageData(imgData, 0, 0);
+            
+            // Dessiner la position actuelle du joueur en rouge
+            mCtx.fillStyle = 'red';
+            mCtx.beginPath();
+            mCtx.arc(wrap(camX, BOARD_SIZE), wrap(camY, BOARD_SIZE), 10, 0, Math.PI * 2);
+            mCtx.fill();
+        }
 
         initNet();
     </script>
