@@ -2,7 +2,7 @@
  * PIXEL PLANET - Serveur MMO Hardcore "Single-File"
  * Architecture : Node.js + ws
  * Contrainte : < 512 Mo RAM
- * Version : 1.6 (GDD Strict, Bug Map Noir Corrigé, Flood Fill, P2P)
+ * Version : 1.7 (GDD Strict 100%, Corrections Clics, Animations et Économie)
  */
 
 const http = require('http');
@@ -136,10 +136,12 @@ const server = http.createServer((req, res) => {
 // --- 6. WEBSOCKET ---
 const wss = new WebSocketServer({ server });
 
+// PRIX ALAN STORE RÉVISÉS POUR ÉVITER LE SOFT-LOCK
 const ALANSTORE_PRICES = {
-    'graine': 50, 'graine_med': 150, 'trousse_secours': 2000, 'pioche': 1000, 'arme': 3000, 
-    'protection_pvp': 2000, 'bloc_etabli': 5000, 'bloc_peinture': 5000, 'bloc_magasin': 8000, 
-    'moteur': 10000, 'bloc_garage': 10000, 'bloc_coffre': 15000, 'bloc_casse': 2000, 'bloc_entreprise': 20000 
+    'pioche': 50, 'graine': 10, 'graine_med': 20, 'munition': 5, 'arme': 1000, 
+    'trousse_secours': 100, 'protection_pvp': 500, 'bloc_etabli': 200, 
+    'bloc_peinture': 300, 'bloc_magasin': 500, 'moteur': 800, 
+    'bloc_garage': 800, 'bloc_coffre': 1000, 'bloc_casse': 500, 'bloc_entreprise': 2000 
 };
 
 wss.on('connection', (ws) => {
@@ -167,7 +169,7 @@ wss.on('connection', (ws) => {
                 if (!usersDb[user].vault) usersDb[user].vault = [];
 
                 ws.user = user;
-                activePlayers.set(ws.id, { user, x: usersDb[user].x, y: usersDb[user].y, isDriving: null, lastMove: 0, facing: 1, moving: false });
+                activePlayers.set(ws.id, { user, x: usersDb[user].x, y: usersDb[user].y, isDriving: null, lastMove: 0, facing: 1, moving: false, mineTicks: 0 });
 
                 const allAvatars = {};
                 for (let u in usersDb) allAvatars[u] = usersDb[u].avatar;
@@ -191,7 +193,6 @@ wss.on('connection', (ws) => {
             if (data.type === 'chat') {
                 const msg = data.msg.substring(0, 100); 
                 
-                // PAIEMENT P2P (GDD)
                 if (msg.startsWith('/pay ')) {
                     const parts = msg.split(' '); const amount = parseInt(parts[2]); const target = parts[1];
                     if (usersDb[target] && amount > 0 && dbRef.pix >= amount) {
@@ -202,10 +203,9 @@ wss.on('connection', (ws) => {
                     return;
                 }
 
-                // ADMIN HERITAGE (GDD)
                 if (msg.startsWith('/admin heritage') && ws.user === 'Admin') {
                     const zone = getZone(playerState.x, playerState.y);
-                    if (zone) { zone.type = 'heritage'; ws.send(JSON.stringify({ type: 'sys', msg: 'Zone classée Patrimoine (Indestructible).' })); }
+                    if (zone) { zone.type = 'heritage'; ws.send(JSON.stringify({ type: 'sys', msg: 'Zone classée Patrimoine.' })); }
                     return;
                 }
 
@@ -226,16 +226,33 @@ wss.on('connection', (ws) => {
             }
 
             if (data.type === 'move') {
-                const moved = (playerState.x !== data.x || playerState.y !== data.y);
                 playerState.x = wrap(data.x, BOARD_SIZE); playerState.y = wrap(data.y, BOARD_SIZE);
-                playerState.facing = data.f; playerState.moving = moved;
-                if (moved) { playerState.lastMove = Date.now(); playerState.mineTicks = 0; } // Annule le minage en cours
+                playerState.facing = data.f; playerState.moving = true;
+                playerState.lastMove = Date.now();
                 dbRef.x = playerState.x; dbRef.y = playerState.y;
+            }
+
+            // GESTION METIER (Détachée des clics souris pour fonctionner partout)
+            if (data.type === 'change_job') {
+                if (!isNexus(playerState.x, playerState.y)) return ws.send(JSON.stringify({ type: 'error', msg: 'Vous devez être dans le Nexus (Zone Bleue).' }));
+                if (Date.now() - (dbRef.lastJobChange || 0) < 300000) return ws.send(JSON.stringify({ type: 'error', msg: 'Délai de 5 minutes requis entre chaque changement.' }));
+                
+                dbRef.job = data.job; dbRef.lastJobChange = Date.now();
+                ws.send(JSON.stringify({ type: 'sys', msg: `Métier : ${data.job}`}));
+                ws.send(JSON.stringify({ type: 'sync_stats', job: dbRef.job }));
+                return;
             }
 
             if (data.type === 'use_item') {
                 if (data.action === 'place') {
                     if (!canModify(ws.user, playerState.x, playerState.y)) return ws.send(JSON.stringify({ type: 'error', msg: 'Terrain Protégé.' }));
+                    
+                    // GDD: Coffre et Magasin uniquement sur terrain personnel
+                    if (data.item === 'bloc_coffre' || data.item === 'bloc_magasin') {
+                        const zone = getZone(playerState.x, playerState.y);
+                        if (!zone || zone.owner !== ws.user) return ws.send(JSON.stringify({ type: 'error', msg: 'Posable UNIQUEMENT sur VOTRE terrain privé.' }));
+                    }
+
                     const blockIds = { 'bloc_etabli': 10, 'bloc_garage': 12, 'bloc_magasin': 13, 'bloc_coffre': 14, 'bloc_casse': 15, 'bloc_entreprise': 16 };
                     const bid = blockIds[data.item];
                     if (bid && consumeItem(ws.user, 'inventory', data.item, 1)) {
@@ -300,7 +317,6 @@ wss.on('connection', (ws) => {
                 return;
             }
 
-            // GESTION ENTREPRISE (GDD 11.1)
             if (data.type === 'add_guest') {
                 cadastre.forEach(z => { if (z.owner === ws.user && !z.guests.includes(data.guest)) z.guests.push(data.guest); });
                 ws.send(JSON.stringify({ type: 'sys', msg: `${data.guest} a reçu les droits sur vos terrains.` }));
@@ -331,43 +347,59 @@ wss.on('connection', (ws) => {
                 return;
             }
 
+            if (data.type === 'destroy_item') {
+                if (dbRef.inventory[data.index]) {
+                    dbRef.inventory.splice(data.index, 1);
+                    ws.send(JSON.stringify({ type: 'sys', msg: 'Objet détruit par la Casse.' }));
+                    ws.send(JSON.stringify({ type: 'sync_stats', inv: dbRef.inventory }));
+                }
+                return;
+            }
+
+            // INTERACTION SOURIS (MAP)
             if (data.type === 'interact') {
-                const tx = wrap(data.x, BOARD_SIZE), ty = wrap(data.y, BOARD_SIZE);
-                if (toroidalDist(playerState.x, playerState.y, tx, ty) > 25) return; // Portée de clic grandement augmentée pour la souris
+                // Arrondi pour éviter les index flottants
+                const tx = Math.floor(wrap(data.x, BOARD_SIZE)), ty = Math.floor(wrap(data.y, BOARD_SIZE));
+                if (toroidalDist(playerState.x, playerState.y, tx, ty) > 25) return; 
                 const idx = getIndex(tx, ty), targetId = board[idx];
 
                 if (isNexus(tx, ty)) {
-                    if (data.action === 'change_job') {
-                        if (Date.now() - dbRef.lastJobChange < 300000) return ws.send(JSON.stringify({ type: 'error', msg: 'Délai de 5 min requis.' }));
-                        dbRef.job = data.job; dbRef.lastJobChange = Date.now();
-                        ws.send(JSON.stringify({ type: 'sys', msg: `Métier : ${data.job}`}));
-                        ws.send(JSON.stringify({ type: 'sync_stats', job: dbRef.job }));
-                    } else if (data.action !== 'interact') ws.send(JSON.stringify({ type: 'error', msg: 'Le Nexus est protégé.' }));
+                    if (data.action !== 'interact') ws.send(JSON.stringify({ type: 'error', msg: 'Le Nexus est protégé.' }));
                     return;
                 }
 
                 if (data.action === 'interact') {
                     if (targetId === 12 && dbRef.job === 'concessionnaire') {
-                        // ALGORITHME FLOOD FILL (GDD 9.1)
-                        if (!consumeItem(ws.user, 'inventory', 'moteur', 1)) return ws.send(JSON.stringify({ type: 'error', msg: 'Moteur requis dans l\'inventaire.' }));
+                        // GDD 9.1: ALGORITHME FLOOD FILL MAX
+                        const engineIdx = dbRef.inventory.findIndex(i => i.id === 'moteur');
+                        if (engineIdx === -1) return ws.send(JSON.stringify({ type: 'error', msg: 'Moteur requis dans l\'inventaire.' }));
+                        const engine = dbRef.inventory[engineIdx];
+                        
+                        let limit = 225; // Voiture
+                        if (engine.mtype === 'Camion') limit = 1500;
+                        if (engine.mtype === 'Train') limit = 1000;
+                        if (engine.mtype === 'Tracteur') limit = 100;
+
                         const visited = new Set(); const queue = [[tx, ty]]; let blocksCount = 0;
-                        while(queue.length > 0 && blocksCount < 225) { // 15x15 max
+                        while(queue.length > 0 && blocksCount < limit) {
                             const [cx, cy] = queue.shift(); const key = `${cx},${cy}`;
                             if (visited.has(key)) continue; visited.add(key);
-                            if (Math.abs(cx - tx) > 7 || Math.abs(cy - ty) > 7) continue; 
+                            if (Math.abs(cx - tx) > 20 || Math.abs(cy - ty) > 20) continue; 
                             const cid = board[getIndex(cx, cy)];
-                            if (cid >= 20 || cid === 12) { // Absorbe carrosserie
+                            if (cid >= 20 || cid === 12) { 
                                 blocksCount++; pixelUpdates.set(key, 0);
                                 queue.push([wrap(cx+1, BOARD_SIZE), cy], [wrap(cx-1, BOARD_SIZE), cy], [cx, wrap(cy+1, BOARD_SIZE)], [cx, wrap(cy-1, BOARD_SIZE)]);
                             }
                         }
-                        giveItem(ws.user, 'inventory', 'vehicule_blueprint', 1, { unique: true, mtype: 'Custom', speed: 40, b: blocksCount });
+                        dbRef.inventory.splice(engineIdx, 1);
+                        giveItem(ws.user, 'inventory', 'vehicule_blueprint', 1, { unique: true, mtype: engine.mtype, speed: engine.speed, b: blocksCount });
                         ws.send(JSON.stringify({ type: 'sys', msg: `Blueprint généré (${blocksCount} blocs) !` }));
                         ws.send(JSON.stringify({ type: 'sync_stats', inv: dbRef.inventory }));
                         return;
                     }
                     if (targetId === 10 && dbRef.job === 'ouvrier') return ws.send(JSON.stringify({ type: 'open_craft' }));
-                    if (targetId === 16) return ws.send(JSON.stringify({ type: 'open_enterprise' })); // Gestion Guilde
+                    if (targetId === 16) return ws.send(JSON.stringify({ type: 'open_enterprise' }));
+                    if (targetId === 15) return ws.send(JSON.stringify({ type: 'open_casse' }));
                     if (targetId === 14) { 
                         if (!canModify(ws.user, tx, ty)) return ws.send(JSON.stringify({ type: 'error', msg: 'Ce coffre n\'est pas à vous.' }));
                         return ws.send(JSON.stringify({ type: 'open_vault', vault: dbRef.vault }));
@@ -384,27 +416,33 @@ wss.on('connection', (ws) => {
                 if (dbRef.stamina < 1) return ws.send(JSON.stringify({ type: 'error', msg: 'Épuisé. Mangez ou reposez-vous.' }));
 
                 if (data.action === 'mine' && dbRef.job === 'ouvrier') {
-                    if (targetId === 5) { // MINAGE INSTANTANÉ (Corrigé)
+                    // GDD: Verification Pioche
+                    const pioche = dbRef.inventory.find(i => i.id === 'pioche');
+                    if (!pioche) return ws.send(JSON.stringify({ type: 'error', msg: 'Il vous faut une pioche (AlanStore).' }));
+
+                    if (targetId === 5) { // Minage Instantané & Speed boost
                         pixelUpdates.set(`${tx},${ty}`, 0); dbRef.stamina -= 1; giveItem(ws.user, 'inventory', 'pixelium', 1);
                         ws.send(JSON.stringify({ type: 'sys', msg: '+1 Pixelium' }));
                     } 
-                    else if (targetId >= 20) { // DEMANTELEMENT DES RUINES (GDD 8.2)
+                    else if (targetId >= 20) { 
                         const zone = getZone(tx, ty);
-                        if (!zone) { // Ruine publique
+                        if (!zone) { 
                             pixelUpdates.set(`${tx},${ty}`, 0); dbRef.stamina -= 1; giveItem(ws.user, 'inventory', 'materiau_recycle', 1);
                             ws.send(JSON.stringify({ type: 'sys', msg: 'Ruine démantelée.' }));
-                        } else ws.send(JSON.stringify({ type: 'error', msg: 'Ce bâtiment est privé.' }));
+                        } else ws.send(JSON.stringify({ type: 'error', msg: 'Bâtiment privé.' }));
                     }
-                    else if (targetId === 15) { // CASSE
-                        pixelUpdates.set(`${tx},${ty}`, 0); dbRef.stamina -= 1; ws.send(JSON.stringify({ type: 'sys', msg: 'Bloc détruit.' }));
-                    }
+                    else if (targetId === 15) { pixelUpdates.set(`${tx},${ty}`, 0); dbRef.stamina -= 1; }
                 }
                 else if (data.action === 'build' && data.colorId !== undefined) {
                     if (dbRef.job !== 'bâtisseur' && dbRef.job !== 'vendeur') return ws.send(JSON.stringify({ type: 'error', msg: 'Métier inadapté.' }));
                     if (!canModify(ws.user, tx, ty)) return ws.send(JSON.stringify({ type: 'error', msg: 'Terrain Protégé.' }));
                     
-                    pixelUpdates.set(`${tx},${ty}`, data.colorId === 255 ? 0 : data.colorId); // 255 = Gomme du Bâtisseur
-                    dbRef.stamina -= 1;
+                    // GDD: Bloc Peinture Enforced
+                    const baseColors = [0, 1, 2, 20, 30, 255]; 
+                    if (!baseColors.includes(data.colorId)) {
+                        if (!dbRef.inventory.find(i => i.id === 'bloc_peinture')) return ws.send(JSON.stringify({ type: 'error', msg: 'Bloc Peinture requis (AlanStore).' }));
+                    }
+                    pixelUpdates.set(`${tx},${ty}`, data.colorId === 255 ? 0 : data.colorId); dbRef.stamina -= 1;
                 }
                 else if (data.action === 'plant') {
                     if (dbRef.job !== 'fermier') return ws.send(JSON.stringify({ type: 'error', msg: 'Seul un Fermier plante.' }));
@@ -412,18 +450,18 @@ wss.on('connection', (ws) => {
                     if (!canModify(ws.user, tx, ty)) return ws.send(JSON.stringify({ type: 'error', msg: 'Terrain Protégé.' }));
                     
                     const isMed = consumeItem(ws.user, 'inventory', 'graine_med', 1);
-                    if (!isMed && !consumeItem(ws.user, 'inventory', 'graine', 1)) return ws.send(JSON.stringify({ type: 'error', msg: 'Graine manquante.' }));
+                    if (!isMed && !consumeItem(ws.user, 'inventory', 'graine', 1)) return ws.send(JSON.stringify({ type: 'error', msg: 'Graines manquantes.' }));
                     
                     pixelUpdates.set(`${tx},${ty}`, isMed ? 7 : 6); 
                     activeCrops.set(`${tx},${ty}`, { plantedAt: Date.now(), owner: ws.user, isMed });
-                    dbRef.stamina -= 1; ws.send(JSON.stringify({ type: 'sys', msg: 'Graine plantée (Pousse: 15 min).' }));
+                    dbRef.stamina -= 1; ws.send(JSON.stringify({ type: 'sys', msg: 'Plante semée (15 min).' }));
                 }
                 else if (data.action === 'harvest') {
                     if (dbRef.job !== 'fermier') return ws.send(JSON.stringify({ type: 'error', msg: 'Seul un Fermier récolte.' }));
                     if (targetId !== 4 && targetId !== 8) return ws.send(JSON.stringify({ type: 'error', msg: 'Rien à récolter.' }));
                     
                     const crop = activeCrops.get(`${tx},${ty}`);
-                    if (crop && Date.now() - crop.plantedAt > 900000) { // 15 mins exacts (GDD 7.2)
+                    if (crop && Date.now() - crop.plantedAt > 900000) { 
                         pixelUpdates.set(`${tx},${ty}`, 1); activeCrops.delete(`${tx},${ty}`);
                         giveItem(ws.user, 'inventory', crop.isMed ? 'herbe' : 'plante', 1); dbRef.stamina -= 1;
                         ws.send(JSON.stringify({ type: 'sys', msg: 'Récolte effectuée !' }));
@@ -431,6 +469,11 @@ wss.on('connection', (ws) => {
                 }
                 else if (data.action === 'shoot') {
                     if (dbRef.job !== 'guerrier') return ws.send(JSON.stringify({ type: 'error', msg: 'Seul un Guerrier tire.' }));
+                    
+                    // GDD: Arme & Munitions Enforced
+                    if (!dbRef.inventory.find(i => i.id === 'arme')) return ws.send(JSON.stringify({ type: 'error', msg: 'Arme requise (AlanStore).' }));
+                    if (!consumeItem(ws.user, 'inventory', 'munition', 1)) return ws.send(JSON.stringify({ type: 'error', msg: 'Munitions requises.' }));
+                    
                     dbRef.stamina -= 1;
                     for (let [oid, ostate] of activePlayers.entries()) {
                         if (oid !== ws.id && toroidalDist(ostate.x, ostate.y, tx, ty) < 4) {
@@ -510,7 +553,7 @@ setInterval(() => {
     const now = Date.now();
     const deltas = [];
 
-    // GDD 8.2: IMPOT FONCIER MATHÉMATIQUE
+    // IMPOT FONCIER (Calcul exact)
     if (now - lastHour > 86400000) { 
         lastHour = now;
         cadastre = cadastre.filter(zone => {
@@ -533,12 +576,12 @@ setInterval(() => {
     const tickMin = (now - lastMin > 60000);
     if (tickMin) lastMin = now;
 
-    // GDD 7.2: Pousse Agriculture
+    // GDD: Agriculture
     activeCrops.forEach((crop, coord) => {
         if (now - crop.plantedAt > 900000) { // 15 mins exacts
             const [cx, cy] = coord.split(',');
-            if (board[getIndex(cx, cy)] === 6) pixelUpdates.set(coord, 4); // Plante
-            if (board[getIndex(cx, cy)] === 7) pixelUpdates.set(coord, 8); // Herbe médicinale
+            if (board[getIndex(cx, cy)] === 6) pixelUpdates.set(coord, 4); 
+            if (board[getIndex(cx, cy)] === 7) pixelUpdates.set(coord, 8); 
         }
     });
 
@@ -546,7 +589,6 @@ setInterval(() => {
         const dbRef = usersDb[state.user];
         if (!dbRef) continue;
         
-        // GDD 1.3: Fontaine du Nexus
         if (tickMin && isNexus(state.x, state.y)) { dbRef.hp = Math.min(100, dbRef.hp + 1); state.hp = dbRef.hp; }
         else if (tickMin && dbRef.hp < 100) { dbRef.hp++; state.hp = dbRef.hp; }
         
@@ -560,8 +602,12 @@ setInterval(() => {
         if (board[getIndex(rx, ry)] === 0 && !isNexus(rx, ry)) pixelUpdates.set(`${rx},${ry}`, 5); 
     }
 
-    // L'animation s'arrête si le joueur n'a pas bougé depuis 150 ms
-    const playersData = Array.from(activePlayers.values()).map(p => ({ u: p.user, x: p.x, y: p.y, d: p.isDriving ? p.isDriving.mtype : null, m: (now - p.lastMove < 150), f: p.facing }));
+    // GDD: Validation du Mouvement pour Animation 
+    for (let [id, p] of activePlayers.entries()) {
+        if (now - p.lastMove > 150) p.moving = false; // Coupe l'animation
+    }
+
+    const playersData = Array.from(activePlayers.values()).map(p => ({ u: p.user, x: p.x, y: p.y, d: p.isDriving ? p.isDriving.mtype : null, m: p.moving, f: p.facing }));
     const broadcastMsg = JSON.stringify({ type: 'tick', p: playersData, d: deltas });
     wss.clients.forEach(c => { if (c.readyState === 1) c.send(broadcastMsg); });
 
@@ -616,7 +662,7 @@ const FRONTEND_HTML = `
         .modal h2 { margin-top: 0; color: #f39c12; border-bottom: 1px solid #444; padding-bottom: 10px; }
         .modal .btn { width: 100%; margin-bottom: 10px; }
         
-        #modal-store, #modal-avatar, #modal-vault, #modal-shop, #modal-craft, #modal-entreprise { width: 600px; }
+        #modal-store, #modal-avatar, #modal-vault, #modal-shop, #modal-craft, #modal-entreprise, #modal-casse { width: 600px; }
         .store-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; text-align: left; }
         .store-section { background: #111; padding: 15px; border-radius: 8px; border: 1px solid #333; max-height: 250px; overflow-y: auto;}
         .store-item { display: flex; justify-content: space-between; margin-bottom: 10px; align-items: center; font-size: 12px; border-bottom: 1px solid #222; padding-bottom: 5px; }
@@ -631,7 +677,7 @@ const FRONTEND_HTML = `
 
         #notif { position: absolute; top: 70px; left: 50%; transform: translateX(-50%); padding: 10px 20px; border-radius: 20px; font-weight: bold; opacity: 0; transition: opacity 0.3s; z-index: 50; }
         #palette { display: none; position: absolute; bottom: 80px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.8); padding: 10px; border-radius: 10px; pointer-events: auto; gap: 5px; border: 1px solid #444; }
-        .color-swatch { width: 25px; height: 25px; border-radius: 5px; cursor: pointer; border: 1px solid #fff; text-align:center; line-height:25px; font-size:12px; }
+        .color-swatch { width: 25px; height: 25px; border-radius: 5px; cursor: pointer; border: 1px solid #fff; text-align:center; line-height:25px; font-size:12px; font-weight:bold; }
     </style>
 </head>
 <body>
@@ -649,8 +695,8 @@ const FRONTEND_HTML = `
             </div>
             <div class="pix-count">🪙 <span id="ui-pix">0</span> Pix</div>
             <div style="display:flex; gap:10px;">
-                <button class="btn" style="background:#e67e22; width:auto; margin:0;" onclick="buyLand()">Acheter Terrain (100 Pix)</button>
-                <button class="btn" style="width:auto; margin:0;" onclick="openStore()">AlanStore</button>
+                <button class="btn" style="background:#e67e22; width:auto; margin:0;" onclick="ws.send(JSON.stringify({ type: 'buy_land' }));">Acheter Terrain (100 Pix)</button>
+                <button class="btn" style="width:auto; margin:0;" onclick="ws.send(JSON.stringify({ type: 'alanstore_req' })); document.getElementById('modal-store').classList.add('show');">AlanStore</button>
             </div>
         </div>
 
@@ -733,6 +779,13 @@ const FRONTEND_HTML = `
         <button class="btn" style="background:#555" onclick="document.getElementById('modal-entreprise').classList.remove('show')">Fermer</button>
     </div>
 
+    <div class="modal" id="modal-casse">
+        <h2>Casse (Destruction)</h2>
+        <p>Sélectionnez un objet à détruire DÉFINITIVEMENT.</p>
+        <div id="casse-list" style="max-height:200px; overflow-y:auto; border:1px solid #333; padding:5px;"></div>
+        <button class="btn" style="background:#555" onclick="document.getElementById('modal-casse').classList.remove('show')">Fermer</button>
+    </div>
+
     <div class="modal" id="modal-store">
         <h2>AlanStore - Boutique Système</h2>
         <div class="store-grid">
@@ -767,16 +820,14 @@ const FRONTEND_HTML = `
         let selectedColorId = 20; 
         let chatMode = 'local', currentShopCoord = null;
         
-        // Local Cache of the Board to prevent getImageData freezes
         let clientBoard = new Uint8Array(BOARD_SIZE * BOARD_SIZE);
-        
-        let offCanvas = document.createElement('canvas');
-        offCanvas.width = BOARD_SIZE; offCanvas.height = BOARD_SIZE;
+        let offCanvas = document.createElement('canvas'); offCanvas.width = BOARD_SIZE; offCanvas.height = BOARD_SIZE;
         let offCtx = offCanvas.getContext('2d');
         
         let playersMap = [], colorDict = {}, avatarsDict = {}; 
         let currentAvatarEdit = [Array(25).fill(255), Array(25).fill(255), Array(25).fill(255)];
         let selectedAvatarColor = 20;
+        let lastMovePacket = 0;
         
         const keys = { w:false, a:false, s:false, d:false, z:false, q:false, arrowup:false, arrowdown:false, arrowleft:false, arrowright:false };
         let facingRight = true;
@@ -851,6 +902,11 @@ const FRONTEND_HTML = `
                 else if (data.type === 'open_vault') { renderVault(data.inv || [], data.vault); document.getElementById('modal-vault').classList.add('show'); }
                 else if (data.type === 'manage_shop') { currentShopCoord = data.coord; renderManageShop(data.shop); document.getElementById('modal-shop').classList.add('show'); }
                 else if (data.type === 'view_shop') { currentShopCoord = data.coord; renderViewShop(data.shop); document.getElementById('modal-shop').classList.add('show'); }
+                else if (data.type === 'open_casse') { 
+                    const list = document.getElementById('casse-list');
+                    list.innerHTML = currentInvData.map((i, idx) => \`<div class="store-item"><span>\${formatItemLabel(i)} x\${i.qty}</span><button class="inv-btn" style="background:#e74c3c" onclick="ws.send(JSON.stringify({type:'destroy_item', index:\${idx}})); document.getElementById('modal-casse').classList.remove('show');">Détruire</button></div>\`).join('');
+                    document.getElementById('modal-casse').classList.add('show');
+                }
                 else if (data.type === 'chat') {
                     const chatEl = document.getElementById('chat-messages');
                     chatEl.innerHTML += \`<p class="chat-\${data.channel}">[\${data.user}] \${data.msg}</p>\`; chatEl.scrollTop = chatEl.scrollHeight;
@@ -869,9 +925,10 @@ const FRONTEND_HTML = `
 
         function auth(isReg) { ws.send(JSON.stringify({ type: 'auth', user: document.getElementById('inp-user').value.trim(), pass: document.getElementById('inp-pass').value, isRegister: isReg })); }
         function sendChat() { const inp = document.getElementById('chat-input'); if (inp.value.trim() !== '') { ws.send(JSON.stringify({ type: 'chat', channel: chatMode, msg: inp.value.trim() })); inp.value = ''; } }
+        function changeJob(job) { ws.send(JSON.stringify({ type: 'change_job', job: job })); document.getElementById('modal-nexus').classList.remove('show'); }
 
         function formatItemLabel(i) {
-            let label = i.id.toUpperCase();
+            let label = i.id.toUpperCase().replace('BLOC_', '');
             if (i.mtype) label += \` [\${i.mtype}]\`; if (i.speed) label += \` ⚡\${i.speed}\`; if (i.dmg) label += \` ⚔️\${i.dmg}\`;
             return label;
         }
@@ -887,7 +944,7 @@ const FRONTEND_HTML = `
                 const invList = document.getElementById('inv-list');
                 invList.innerHTML = state.inv.map(i => {
                     let btn = '';
-                    if (['plante', 'herbe', 'vehicule_blueprint', 'moteur', 'protection_pvp', 'trousse_secours'].includes(i.id)) btn = \`<button class="inv-btn" onclick="useItem('\${i.id}')">Utiliser</button>\`;
+                    if (['plante', 'herbe', 'vehicule_blueprint', 'moteur', 'protection_pvp', 'trousse_secours'].includes(i.id)) btn = \`<button class="inv-btn" onclick="ws.send(JSON.stringify({type:'use_item', item:'\${i.id}'}))">Utiliser</button>\`;
                     if (i.id.startsWith('bloc_')) btn = \`<button class="inv-btn" style="background:#8e44ad" onclick="ws.send(JSON.stringify({type:'use_item', action:'place', item:'\${i.id}'}))">Poser</button>\`;
                     return \`<div class="inv-slot"><span>\${formatItemLabel(i)} x\${i.qty}</span>\${btn}</div>\`;
                 }).join('');
@@ -926,13 +983,11 @@ const FRONTEND_HTML = `
         });
         window.addEventListener('keyup', e => { if(keys[e.key.toLowerCase()] !== undefined) keys[e.key.toLowerCase()] = false; });
 
-        let interactInterval = null;
-        let isMouseDown = false;
-        let lastMouseX = 0, lastMouseY = 0;
+        let interactInterval = null; let isMouseDown = false; let lastMouseX = 0, lastMouseY = 0;
 
         canvas.addEventListener('mousemove', (e) => { lastMouseX = e.clientX; lastMouseY = e.clientY; });
         canvas.addEventListener('mousedown', (e) => { 
-            if (e.target !== canvas) return; // Empêche de cliquer à travers l'interface UI
+            if (e.target !== canvas) return; 
             isMouseDown = true; lastMouseX = e.clientX; lastMouseY = e.clientY; handleInteract(); 
             interactInterval = setInterval(() => { if (isMouseDown) handleInteract(); }, 200); 
         });
@@ -942,14 +997,14 @@ const FRONTEND_HTML = `
             if (!myUser) return;
             const rect = canvas.getBoundingClientRect();
             const cx = canvas.width / 2, cy = canvas.height / 2;
-            const worldX = Math.floor(camX + (lastMouseX - rect.left - cx) / scale);
-            const worldY = Math.floor(camY + (lastMouseY - rect.top - cy) / scale);
+            const worldX = camX + (lastMouseX - rect.left - cx) / scale;
+            const worldY = camY + (lastMouseY - rect.top - cy) / scale;
 
-            const wrappedX = wrap(worldX, BOARD_SIZE);
-            const wrappedY = wrap(worldY, BOARD_SIZE);
+            const wrappedX = Math.floor(wrap(worldX, BOARD_SIZE));
+            const wrappedY = Math.floor(wrap(worldY, BOARD_SIZE));
             const targetId = clientBoard[getIndex(wrappedX, wrappedY)];
 
-            let action = 'interact'; // Clic intelligent : l'action dépend de ce qu'on pointe !
+            let action = 'interact'; 
             if (myJob === 'ouvrier') {
                 if (targetId === 5 || targetId === 15 || targetId >= 20) action = 'mine';
                 else if (targetId === 10) action = 'craft';
@@ -957,7 +1012,7 @@ const FRONTEND_HTML = `
             else if (myJob === 'bâtisseur' || myJob === 'vendeur') action = 'build';
             else if (myJob === 'fermier') {
                 if (targetId === 1) action = 'plant';
-                else if (targetId === 4 || targetId === 8) action = 'harvest';
+                else if (targetId === 4 || targetId === 8 || targetId === 6 || targetId === 7) action = 'harvest';
             }
             else if (myJob === 'guerrier') action = 'shoot';
 
@@ -972,10 +1027,7 @@ const FRONTEND_HTML = `
             if (!myUser) return;
 
             let baseSpeed = 10; 
-            const wrappedCamX = wrap(Math.floor(camX), BOARD_SIZE);
-            const wrappedCamY = wrap(Math.floor(camY), BOARD_SIZE);
-            
-            const pxColorId = clientBoard[getIndex(wrappedCamX, wrappedCamY)];
+            const pxColorId = clientBoard[getIndex(Math.floor(wrap(camX, BOARD_SIZE)), Math.floor(wrap(camY, BOARD_SIZE)))];
             
             if (isDriving) {
                 if (isDriving === 'Train') baseSpeed = (pxColorId === 3) ? 45 : 0; 
@@ -991,7 +1043,10 @@ const FRONTEND_HTML = `
 
             camX = wrap(camX, BOARD_SIZE); camY = wrap(camY, BOARD_SIZE);
 
-            if (moved) ws.send(JSON.stringify({ type: 'move', x: camX, y: camY, f: facingRight ? 1 : -1 }));
+            if (moved && Date.now() - lastMovePacket > 100) { 
+                ws.send(JSON.stringify({ type: 'move', x: camX, y: camY, f: facingRight ? 1 : -1 })); 
+                lastMovePacket = Date.now(); 
+            }
 
             ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
             ctx.save(); ctx.translate(canvas.width / 2, canvas.height / 2); ctx.scale(scale, scale); ctx.translate(-camX, -camY);
@@ -1007,15 +1062,14 @@ const FRONTEND_HTML = `
                     ctx.fillStyle = "rgba(0, 255, 255, 0.15)"; ctx.fillRect(bx + 475, by + 475, 50, 50);
                     ctx.strokeStyle = "rgba(0, 255, 255, 0.5)"; ctx.lineWidth = 1; ctx.strokeRect(bx + 475, by + 475, 50, 50);
                     ctx.fillStyle = "rgba(0, 255, 255, 0.9)"; ctx.font = '2.5px Arial'; ctx.textAlign = 'center';
-                    ctx.fillText("NEXUS (Zone Pacifique)", bx + 500, by + 500);
+                    ctx.fillText("NEXUS (Zone Sûre)", bx + 500, by + 500);
                 }
             }
 
             for (let p of playersMap) {
                 const cPos = getContinuousPos(p.x, p.y, camX, camY);
 
-                ctx.save();
-                ctx.translate(cPos.x, cPos.y);
+                ctx.save(); ctx.translate(cPos.x, cPos.y);
 
                 if (p.d) { 
                     ctx.fillStyle = (p.u === myUser) ? '#e67e22' : '#d35400'; ctx.fillRect(-7, -7, 15, 15); 
@@ -1036,47 +1090,31 @@ const FRONTEND_HTML = `
 
                 ctx.font = '3px Arial'; ctx.textAlign = 'center';
                 const textW = ctx.measureText(p.u).width;
-                ctx.fillStyle = "rgba(0, 0, 0, 0.6)"; ctx.fillRect(cPos.x - textW/2 - 1, cPos.y - 8, textW + 2, 4);
+                ctx.fillStyle = "rgba(0, 0, 0, 0.6)"; ctx.fillRect(cPos.x - textW/2 - 2, cPos.y - 9, textW + 4, 5);
                 ctx.strokeStyle = "black"; ctx.lineWidth = 0.5; ctx.strokeText(p.u, cPos.x, cPos.y - 5);
                 ctx.fillStyle = 'white'; ctx.fillText(p.u, cPos.x, cPos.y - 5);
             }
             ctx.restore();
         }
 
-        function changeJob(job) { ws.send(JSON.stringify({ type: 'interact', x: camX, y: camY, action: 'change_job', job: job })); document.getElementById('modal-nexus').classList.remove('show'); }
-        function buyLand() { ws.send(JSON.stringify({ type: 'buy_land' })); }
-        function useItem(id) { ws.send(JSON.stringify({ type: 'use_item', item: id })); }
         function craft(recipe) { ws.send(JSON.stringify({ type: 'craft_etabli', recipe: recipe })); document.getElementById('modal-craft').classList.remove('show'); }
-
-        function openStore() { ws.send(JSON.stringify({ type: 'alanstore_req' })); document.getElementById('modal-store').classList.add('show'); }
-        function buySys(item) { ws.send(JSON.stringify({ type: 'alanstore_buy_sys', item })); }
-        function buyOcc(index) { ws.send(JSON.stringify({ type: 'alanstore_buy_occ', index })); }
 
         function renderAlanStore(occasionData, prices) {
             const sysList = document.getElementById('sys-store-list');
-            const items = [
-                {id:'pioche',n:'Pioche'},{id:'moteur',n:'Moteur'},{id:'arme',n:'Arme'},
-                {id:'graine',n:'Graines'},{id:'graine_med',n:'Graines Médicinales'},{id:'trousse_secours',n:'Trousse Secours'},
-                {id:'protection_pvp',n:'Bouclier PvP'},{id:'bloc_etabli',n:'Établi'},{id:'bloc_peinture',n:'Peinture'},
-                {id:'bloc_garage',n:'Garage'},{id:'bloc_magasin',n:'Magasin'},{id:'bloc_coffre',n:'Coffre'},
-                {id:'bloc_casse',n:'Casse'},{id:'bloc_entreprise',n:'Entreprise'}
-            ];
-            sysList.innerHTML = items.map(i => \`<div class="store-item"><span>\${i.n}</span><button class="inv-btn" onclick="buySys('\${i.id}')">\${prices[i.id]} Pix</button></div>\`).join('');
+            const items = [{id:'pioche',n:'Pioche'},{id:'moteur',n:'Moteur'},{id:'arme',n:'Arme'},{id:'munition',n:'Balle (x1)'},{id:'graine',n:'Graines'},{id:'graine_med',n:'Graines Médicinales'},{id:'trousse_secours',n:'Trousse Secours'},{id:'protection_pvp',n:'Bouclier PvP'},{id:'bloc_etabli',n:'Établi'},{id:'bloc_peinture',n:'Peinture'},{id:'bloc_garage',n:'Garage'},{id:'bloc_magasin',n:'Magasin'},{id:'bloc_coffre',n:'Coffre'},{id:'bloc_casse',n:'Casse'},{id:'bloc_entreprise',n:'Entreprise'}];
+            sysList.innerHTML = items.map(i => \`<div class="store-item"><span>\${i.n}</span><button class="inv-btn" onclick="ws.send(JSON.stringify({ type: 'alanstore_buy_sys', item: '\${i.id}' }));">\${prices[i.id]} Pix</button></div>\`).join('');
             const occList = document.getElementById('occasion-list');
             if (occasionData.length === 0) occList.innerHTML = "<p style='font-size:12px;color:#888'>Aucun butin saisi.</p>";
-            else occList.innerHTML = occasionData.map((item, idx) => \`<div class="store-item" style="border-bottom:1px dashed #444"><span style="color:#f1c40f">\${formatItemLabel(item)} x\${item.qty}</span><button class="inv-btn" style="background:#8e44ad" onclick="buyOcc(\${idx})">50 Pix</button></div>\`).join('');
+            else occList.innerHTML = occasionData.map((item, idx) => \`<div class="store-item" style="border-bottom:1px dashed #444"><span style="color:#f1c40f">\${formatItemLabel(item)} x\${item.qty}</span><button class="inv-btn" style="background:#8e44ad" onclick="ws.send(JSON.stringify({ type: 'alanstore_buy_occ', index: \${idx} }));">50 Pix</button></div>\`).join('');
         }
 
         function buildPalette() {
             const pal = document.getElementById('palette'); pal.innerHTML = '';
             const buildable = [20, 21, 22, 23, 30, 31, 32, 2, 1, 10, 11, 12, 13, 14, 15, 16]; 
-            
-            // L'outil "Gomme" du Bâtisseur (ID 255 efface la zone et remet Nature)
             const gommeDiv = document.createElement('div');
             gommeDiv.className = 'color-swatch'; gommeDiv.style.background = '#000'; gommeDiv.style.borderColor = 'red'; gommeDiv.innerText = 'X';
             gommeDiv.onclick = () => { selectedColorId = 255; document.querySelectorAll('.color-swatch').forEach(el => el.style.borderColor = 'white'); gommeDiv.style.borderColor = '#f1c40f'; };
             pal.appendChild(gommeDiv);
-
             for (let id of buildable) {
                 const div = document.createElement('div');
                 div.className = 'color-swatch'; div.style.backgroundColor = colorDict[id];
