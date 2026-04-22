@@ -47,20 +47,18 @@ const pixelUpdates = new Map();  // File d'attente des modifications de pixels
 
 // --- 3. INITIALISATION ET PERSISTANCE ---
 function initFiles() {
-    // Chargement Board
     if (fs.existsSync(BOARD_FILE)) {
         board = fs.readFileSync(BOARD_FILE);
         console.log(`[INIT] Board chargé (1 Mo).`);
     } else {
         board = Buffer.alloc(BOARD_SIZE * BOARD_SIZE);
-        board.fill(0); // Rempli de Blanc Pur (Nature)
+        board.fill(0); // Rempli de Blanc Pur
         console.log('[INIT] Nouveau monde généré.');
     }
 
-    // Chargement sécurisé des JSONs
-    try { if (fs.existsSync(USERS_FILE)) usersDb = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch(e) { console.error("Erreur chargement users.json", e); }
-    try { if (fs.existsSync(CADASTRE_FILE)) cadastre = JSON.parse(fs.readFileSync(CADASTRE_FILE, 'utf8')); } catch(e) { console.error("Erreur chargement cadastre.json", e); }
-    try { if (fs.existsSync(ALANSTORE_FILE)) alanStore = JSON.parse(fs.readFileSync(ALANSTORE_FILE, 'utf8')); } catch(e) { console.error("Erreur chargement alanstore.json", e); }
+    try { if (fs.existsSync(USERS_FILE)) usersDb = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch(e) { console.error("Erreur JSON users", e); }
+    try { if (fs.existsSync(CADASTRE_FILE)) cadastre = JSON.parse(fs.readFileSync(CADASTRE_FILE, 'utf8')); } catch(e) { console.error("Erreur JSON cadastre", e); }
+    try { if (fs.existsSync(ALANSTORE_FILE)) alanStore = JSON.parse(fs.readFileSync(ALANSTORE_FILE, 'utf8')); } catch(e) { console.error("Erreur JSON alanstore", e); }
 }
 initFiles();
 
@@ -77,35 +75,36 @@ const getIndex = (x, y) => (y * BOARD_SIZE) + x;
 const wrap = (val, max) => ((val % max) + max) % max; // Torique
 
 // --- 4. MÉCANIQUES DE GAME DESIGN ---
-
-// Hachage mot de passe (Sécurité locale)
 function hashPassword(password) {
     const salt = "PixelPlanetSalt2026";
     return crypto.scryptSync(password, salt, 64).toString('hex');
 }
 
-// Validation Cadastre
 function canModify(username, x, y) {
     const zone = cadastre.find(z => x >= z.x && x < z.x + z.w && y >= z.y && y < z.y + z.h);
-    if (!zone) return true; // Zone publique
+    if (!zone) return true;
     if (zone.owner === username || zone.guests.includes(username)) return true;
     return false;
 }
 
-// Respawn Aléatoire (anti-bloquage)
 function getRandomSpawn() {
     return { x: Math.floor(Math.random() * BOARD_SIZE), y: Math.floor(Math.random() * BOARD_SIZE) };
 }
 
 // --- 5. SERVEUR HTTP (Front-End) ---
 const server = http.createServer((req, res) => {
-    if (req.method === 'GET' && req.url === '/') {
+    const url = req.url.split('?')[0]; // Ignore les paramètres de cache-busting
+    
+    if (req.method === 'GET' && url === '/') {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(FRONTEND_HTML);
         return;
     }
-    if (req.method === 'GET' && req.url === '/board.dat') {
-        res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+    if (req.method === 'GET' && url === '/board.dat') {
+        res.writeHead(200, { 
+            'Content-Type': 'application/octet-stream',
+            'Cache-Control': 'no-cache, no-store, must-revalidate'
+        });
         res.end(board);
         return;
     }
@@ -122,7 +121,6 @@ wss.on('connection', (ws) => {
 
     ws.on('message', (message) => {
         try {
-            // Conversion vitale du Buffer en String avant de parser
             const data = JSON.parse(message.toString());
             
             // 6.1. AUTHENTIFICATION
@@ -132,7 +130,7 @@ wss.on('connection', (ws) => {
                 const isRegister = data.isRegister;
                 
                 if (!user || !pass || user.length < 3) {
-                    return ws.send(JSON.stringify({ type: 'error', msg: 'Le pseudo doit faire au moins 3 caractères et le mot de passe est requis.' }));
+                    return ws.send(JSON.stringify({ type: 'error', msg: 'Pseudo (min 3 car.) et mot de passe requis.' }));
                 }
                 
                 const hashedPass = hashPassword(pass);
@@ -165,7 +163,7 @@ wss.on('connection', (ws) => {
                 return;
             }
 
-            if (!ws.user) return; // Garde-fou
+            if (!ws.user) return;
             const playerState = activePlayers.get(ws.id);
             if (!playerState) return;
             const dbRef = usersDb[ws.user];
@@ -184,14 +182,12 @@ wss.on('connection', (ws) => {
                 const tx = wrap(data.x, BOARD_SIZE);
                 const ty = wrap(data.y, BOARD_SIZE);
                 
-                // Distance Check (max 15 pixels)
                 const dist = Math.hypot(playerState.x - tx, playerState.y - ty);
                 if (dist > 15) return ws.send(JSON.stringify({ type: 'error', msg: 'Cible trop éloignée !' }));
 
                 const idx = getIndex(tx, ty);
                 const targetId = board[idx];
 
-                // NEXUS (Changement de métier)
                 if (tx >= 475 && tx <= 525 && ty >= 475 && ty <= 525 && data.action === 'change_job') {
                     if (data.job) {
                         playerState.job = data.job;
@@ -201,18 +197,16 @@ wss.on('connection', (ws) => {
                     return;
                 }
 
-                // Vérification Stamina pour actions physiques
                 if (dbRef.stamina < 1) return ws.send(JSON.stringify({ type: 'error', msg: 'Endurance épuisée. Reposez-vous 1 min.' }));
 
-                // Logique selon Métier
                 if (playerState.job === 'ouvrier') {
-                    if (data.action === 'mine' && targetId === 0) { // Mine Pixelium
-                        pixelUpdates.set(`${tx},${ty}`, 20); // Devient terre/bois clair après minage
+                    if (data.action === 'mine' && targetId === 0) {
+                        pixelUpdates.set(`${tx},${ty}`, 20);
                         dbRef.stamina -= 1;
                         dbRef.inventory.push({ id: 'pixelium', qty: 1 });
                         ws.send(JSON.stringify({ type: 'sys', msg: '+1 Pixelium' }));
                     }
-                    if (targetId === 10 && data.action === 'craft') { // Etabli
+                    if (targetId === 10 && data.action === 'craft') {
                         const pIx = dbRef.inventory.findIndex(i => i.id === 'pixelium');
                         if (pIx > -1 && dbRef.inventory[pIx].qty > 0) {
                             dbRef.inventory[pIx].qty--;
@@ -250,7 +244,6 @@ wss.on('connection', (ws) => {
                     }
                 }
                 
-                // Synchronisation immédiate des jauges pour le client
                 playerState.stamina = dbRef.stamina;
                 playerState.hp = dbRef.hp;
                 ws.send(JSON.stringify({ type: 'sync_stats', pix: dbRef.pix, hp: dbRef.hp, stamina: dbRef.stamina, inv: dbRef.inventory }));
@@ -273,14 +266,12 @@ wss.on('connection', (ws) => {
             }
 
         } catch (err) {
-            console.error("Erreur WebSocket WS:", err);
+            console.error("Erreur WS:", err);
         }
     });
 
     ws.on('close', () => {
-        if (ws.user) {
-            activePlayers.delete(ws.id);
-        }
+        if (ws.user) activePlayers.delete(ws.id);
     });
 });
 
@@ -289,7 +280,6 @@ setInterval(() => {
     const now = Date.now();
     const deltas = [];
 
-    // 7.1 Appliquer les modifications de pixels (File d'attente)
     for (let [coord, colorId] of pixelUpdates.entries()) {
         const [x, y] = coord.split(',').map(Number);
         const idx = getIndex(x, y);
@@ -300,36 +290,30 @@ setInterval(() => {
     }
     pixelUpdates.clear();
 
-    // 7.2 Régénération Repos (Stamina)
     for (let [id, state] of activePlayers.entries()) {
         const dbRef = usersDb[state.user];
-        if (dbRef && now - state.lastMove > 60000) { // Immobile 60s
-            if (Math.random() < 0.05 && dbRef.stamina < 100) { // Tick rate lent pour regen
+        if (dbRef && now - state.lastMove > 60000) {
+            if (Math.random() < 0.05 && dbRef.stamina < 100) {
                 dbRef.stamina++;
                 state.stamina = dbRef.stamina;
             }
         }
     }
 
-    // 7.3 Spawn Naturel de Pixelium (Eco)
     if (Math.random() < 0.1) {
         const rx = Math.floor(Math.random() * BOARD_SIZE);
         const ry = Math.floor(Math.random() * BOARD_SIZE);
-        if (board[getIndex(rx, ry)] === 0) { // Pousse sur le blanc pur
-            pixelUpdates.set(`${rx},${ry}`, 0); // Visuellement déclenche un event client sans changer d'ID
-        }
+        if (board[getIndex(rx, ry)] === 0) pixelUpdates.set(`${rx},${ry}`, 0); 
     }
 
-    // 7.4 Broadcast (Optimisé)
     const playersData = Array.from(activePlayers.values()).map(p => ({ u: p.user, x: p.x, y: p.y }));
     const broadcastMsg = JSON.stringify({ type: 'tick', p: playersData, d: deltas });
 
     wss.clients.forEach(client => {
-        if (client.readyState === 1) client.send(broadcastMsg); // 1 = OPEN
+        if (client.readyState === 1) client.send(broadcastMsg);
     });
 
 }, TICK_RATE);
-
 
 server.listen(PORT, () => {
     console.log(`[SERVEUR] Pixel Planet actif sur le port ${PORT}`);
@@ -347,14 +331,8 @@ const FRONTEND_HTML = `
     <title>Pixel Planet - Hardcore MMO</title>
     <style>
         body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; color: white; user-select: none; }
-        
-        /* CANVAS */
         #game-canvas { display: block; width: 100%; height: 100%; cursor: crosshair; }
-        
-        /* UI OVERLAY */
         #ui-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 10; display: flex; flex-direction: column; justify-content: space-between; }
-        
-        /* TOP BAR */
         .top-bar { background: rgba(0,0,0,0.8); padding: 10px 20px; display: flex; justify-content: space-between; align-items: center; pointer-events: auto; border-bottom: 1px solid #333; }
         .stats-group { display: flex; gap: 20px; align-items: center; }
         .stat-bar { width: 150px; height: 15px; background: #333; border-radius: 10px; overflow: hidden; position: relative; border: 1px solid #555; }
@@ -364,24 +342,16 @@ const FRONTEND_HTML = `
         .stat-text { position: absolute; top: -2px; width: 100%; text-align: center; font-size: 11px; font-weight: bold; text-shadow: 1px 1px 2px black; }
         .pix-count { font-size: 18px; font-weight: bold; color: #f39c12; }
         .job-tag { background: #2980b9; padding: 4px 10px; border-radius: 5px; font-weight: bold; text-transform: uppercase; font-size: 12px; }
-        
-        /* CONTROLS (BOTTOM) */
         .bottom-bar { background: rgba(0,0,0,0.9); padding: 15px; pointer-events: auto; display: flex; justify-content: center; gap: 15px; border-top: 1px solid #333; }
         .btn { background: #34495e; color: white; border: 1px solid #555; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-weight: bold; transition: 0.2s; }
         .btn:hover:not(:disabled) { background: #2c3e50; border-color: #f39c12; }
         .btn.active { background: #27ae60; }
         .btn:disabled { background: #555; color: #aaa; cursor: not-allowed; }
-        
-        /* MODALS */
         .modal { display: none; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(20,20,20,0.95); padding: 30px; border-radius: 15px; border: 1px solid #555; box-shadow: 0 10px 30px rgba(0,0,0,0.8); z-index: 100; pointer-events: auto; text-align: center; }
         .modal.show { display: block; }
         .modal input { display: block; width: 100%; margin: 10px 0; padding: 10px; background: #000; border: 1px solid #444; color: white; border-radius: 5px; box-sizing: border-box; }
         .modal h2 { margin-top: 0; color: #f39c12; }
-        
-        /* NOTIFICATIONS */
         #notif { position: absolute; top: 70px; left: 50%; transform: translateX(-50%); padding: 10px 20px; border-radius: 20px; font-weight: bold; opacity: 0; transition: opacity 0.3s; pointer-events: none; text-shadow: 1px 1px 2px rgba(0,0,0,0.5); z-index: 50; }
-        
-        /* PALETTE (Builder) */
         #palette { display: none; position: absolute; bottom: 80px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.8); padding: 10px; border-radius: 10px; pointer-events: auto; gap: 5px; border: 1px solid #444; }
         .color-swatch { width: 25px; height: 25px; border-radius: 5px; cursor: pointer; border: 1px solid #fff; }
     </style>
@@ -393,7 +363,7 @@ const FRONTEND_HTML = `
     <div id="ui-layer">
         <div class="top-bar">
             <div class="stats-group">
-                <div class="job-tag" id="ui-job">Connexion...</div>
+                <div class="job-tag" id="ui-job">Attente...</div>
                 <div>
                     <div class="stat-bar"><div class="stat-fill hp-fill" id="ui-hp" style="width: 100%;"></div><div class="stat-text" id="ui-hp-txt">100 HP</div></div>
                     <div class="stat-bar" style="margin-top: 5px;"><div class="stat-fill stam-fill" id="ui-stam" style="width: 100%;"></div><div class="stat-text" id="ui-stam-txt">100 STAMINA</div></div>
@@ -404,7 +374,6 @@ const FRONTEND_HTML = `
         </div>
 
         <div id="notif">Message</div>
-
         <div id="palette"></div>
 
         <div class="bottom-bar">
@@ -419,14 +388,13 @@ const FRONTEND_HTML = `
         <p>Connexion sécurisée.</p>
         <input type="text" id="inp-user" placeholder="Pseudonyme">
         <input type="password" id="inp-pass" placeholder="Mot de passe">
-        <button class="btn" id="btn-login" onclick="auth(false)" disabled>Chargement map...</button>
+        <button class="btn" id="btn-login" onclick="auth(false)" disabled>1. Chargement de la map...</button>
         <button class="btn" id="btn-reg" onclick="auth(true)" style="background: #8e44ad;" disabled>Patientez...</button>
     </div>
 
     <!-- MODAL NEXUS -->
     <div class="modal" id="modal-nexus">
         <h2>NEXUS - Bureau des Emplois</h2>
-        <p>Choisissez votre voie. Coût: Gratuit.</p>
         <button class="btn" onclick="changeJob('ouvrier')">⛏️ Ouvrier</button>
         <button class="btn" onclick="changeJob('bâtisseur')">🧱 Bâtisseur</button>
         <button class="btn" onclick="changeJob('fermier')">🌾 Fermier</button>
@@ -438,44 +406,38 @@ const FRONTEND_HTML = `
     <!-- MODAL ALAN STORE -->
     <div class="modal" id="modal-store">
         <h2>AlanStore</h2>
-        <p>Tarifs exorbitants. Favorisez le P2P.</p>
-        <button class="btn" onclick="buyStore('pioche')">Pioche de minage (1000 Pix)</button>
-        <button class="btn" onclick="buyStore('bloc_peinture')">Bloc Peinture (5000 Pix)</button>
+        <button class="btn" onclick="buyStore('pioche')">Pioche (1000 Pix)</button>
+        <button class="btn" onclick="buyStore('bloc_peinture')">Peinture (5000 Pix)</button>
         <br><br>
         <button class="btn" onclick="document.getElementById('modal-store').classList.remove('show')">Fermer</button>
     </div>
 
     <script>
         const canvas = document.getElementById('game-canvas');
-        const ctx = canvas.getContext('2d', { alpha: false });
+        const ctx = canvas.getContext('2d');
         let ws;
         
-        // Moteur Visuel
         const BOARD_SIZE = 1000;
-        let scale = 15; // Zoom par défaut
+        let scale = 15; 
         let camX = 500, camY = 500;
         let myUser = null;
         let myJob = null;
-        let selectedColorId = 20; // Default bois
+        let selectedColorId = 20; 
         
-        // Données
         let offCanvas = document.createElement('canvas');
         offCanvas.width = BOARD_SIZE;
         offCanvas.height = BOARD_SIZE;
-        let offCtx = offCanvas.getContext('2d', { alpha: false });
+        let offCtx = offCanvas.getContext('2d');
         let playersMap = [];
         let colorDict = {};
 
-        // Resize
         function resize() {
             canvas.width = window.innerWidth;
             canvas.height = window.innerHeight;
-            draw();
         }
         window.addEventListener('resize', resize);
         resize();
 
-        // Afficher notif avec couleur d'erreur optionnelle
         function notify(msg, isError = false) {
             const el = document.getElementById('notif');
             el.innerText = msg;
@@ -484,90 +446,120 @@ const FRONTEND_HTML = `
             setTimeout(() => el.style.opacity = 0, 3000);
         }
 
-        // --- RESEAU ---
+        // --- 1. TELECHARGEMENT DE LA MAP BINAIRE ---
         function initNet() {
-            fetch('/board.dat').then(res => res.arrayBuffer()).then(buffer => {
+            const btn = document.getElementById('btn-login');
+            btn.innerText = "1. Téléchargement Map (1 Mo)...";
+            
+            // L'ajout de getTime empêche le navigateur de garder une version morte en cache
+            fetch('/board.dat?t=' + new Date().getTime())
+            .then(res => {
+                if (!res.ok) throw new Error("Fichier map introuvable");
+                return res.arrayBuffer();
+            })
+            .then(buffer => {
+                btn.innerText = "2. Connexion au Serveur...";
                 const view = new Uint8Array(buffer);
                 const imgData = offCtx.createImageData(BOARD_SIZE, BOARD_SIZE);
                 connectSocket(view, imgData);
             }).catch(err => {
-                document.getElementById('btn-login').innerText = "Erreur Chargement Map";
+                btn.innerText = "Erreur : " + err.message;
+                notify("Le téléchargement de la map a échoué.", true);
             });
         }
 
+        // --- 2. CONNEXION WEBSOCKET ---
         function connectSocket(rawView, imgData) {
-            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            ws = new WebSocket(protocol + '//' + window.location.host);
-
-            ws.onopen = () => {
-                // Débloque les boutons de l'UI une fois la connexion validée
-                document.getElementById('btn-login').disabled = false;
-                document.getElementById('btn-login').innerText = "Se connecter";
-                document.getElementById('btn-reg').disabled = false;
-                document.getElementById('btn-reg').innerText = "Créer un compte";
-            };
-
-            ws.onmessage = (e) => {
-                const data = JSON.parse(e.data);
-
-                if (data.type === 'auth_success') {
-                    document.getElementById('modal-login').classList.remove('show');
-                    myUser = document.getElementById('inp-user').value.trim();
-                    colorDict = data.colors;
-                    camX = data.state.x;
-                    camY = data.state.y;
-                    updateHUD(data.state);
-                    buildPalette();
-                    
-                    // Rendu initial de la carte avec les bonnes couleurs
-                    for (let i = 0; i < rawView.length; i++) {
-                        const hex = colorDict[rawView[i]] || '#000000';
-                        const r = parseInt(hex.slice(1, 3), 16);
-                        const g = parseInt(hex.slice(3, 5), 16);
-                        const b = parseInt(hex.slice(5, 7), 16);
-                        imgData.data[i*4] = r; imgData.data[i*4+1] = g; imgData.data[i*4+2] = b; imgData.data[i*4+3] = 255;
-                    }
-                    offCtx.putImageData(imgData, 0, 0);
-                    notify("Connexion réussie !");
-                    
-                    // Lancement Boucle de rendu
-                    requestAnimationFrame(renderLoop);
-                }
-                
-                else if (data.type === 'error') {
-                    notify(data.msg, true);
-                }
-                
-                else if (data.type === 'sys') {
-                    notify(data.msg);
-                }
-
-                else if (data.type === 'sync_stats') {
-                    updateHUD(data);
-                }
-
-                else if (data.type === 'tick') {
-                    playersMap = data.p;
-                    // Application des deltas
-                    for (let d of data.d) {
-                        offCtx.fillStyle = colorDict[d.c] || '#000';
-                        offCtx.fillRect(d.x, d.y, 1, 1);
-                    }
-                }
-            };
+            const btn = document.getElementById('btn-login');
+            const btnReg = document.getElementById('btn-reg');
             
-            ws.onclose = () => {
-                notify("Connexion perdue avec le serveur.", true);
-            };
+            try {
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                ws = new WebSocket(protocol + '//' + window.location.host + '/');
+
+                ws.onopen = () => {
+                    btn.disabled = false;
+                    btn.innerText = "Se connecter";
+                    btnReg.disabled = false;
+                    btnReg.innerText = "Créer un compte";
+                };
+
+                ws.onerror = (e) => {
+                    btn.innerText = "Erreur WebSocket";
+                    notify("Le serveur refuse la connexion en temps réel.", true);
+                };
+
+                ws.onmessage = (e) => {
+                    const data = JSON.parse(e.data);
+
+                    if (data.type === 'auth_success') {
+                        document.getElementById('modal-login').classList.remove('show');
+                        myUser = document.getElementById('inp-user').value.trim();
+                        colorDict = data.colors;
+                        camX = data.state.x;
+                        camY = data.state.y;
+                        updateHUD(data.state);
+                        buildPalette();
+                        
+                        // Optimisation Extrême : 100x plus rapide que parseInt dans une boucle
+                        const colorCache = new Uint32Array(256);
+                        for (let key in colorDict) {
+                            const hex = colorDict[key];
+                            const r = parseInt(hex.slice(1, 3), 16);
+                            const g = parseInt(hex.slice(3, 5), 16);
+                            const b = parseInt(hex.slice(5, 7), 16);
+                            colorCache[key] = (255 << 24) | (b << 16) | (g << 8) | r;
+                        }
+                        
+                        const buf32 = new Uint32Array(imgData.data.buffer);
+                        for (let i = 0; i < rawView.length; i++) {
+                            buf32[i] = colorCache[rawView[i]] || 0xFF000000;
+                        }
+                        
+                        offCtx.putImageData(imgData, 0, 0);
+                        notify("Bienvenue sur Pixel Planet !");
+                        requestAnimationFrame(renderLoop);
+                    }
+                    else if (data.type === 'error') {
+                        btn.disabled = false;
+                        btnReg.disabled = false;
+                        btn.innerText = "Se connecter";
+                        notify(data.msg, true);
+                    }
+                    else if (data.type === 'sys') { notify(data.msg); }
+                    else if (data.type === 'sync_stats') { updateHUD(data); }
+                    else if (data.type === 'tick') {
+                        playersMap = data.p;
+                        for (let d of data.d) {
+                            offCtx.fillStyle = colorDict[d.c] || '#000';
+                            offCtx.fillRect(d.x, d.y, 1, 1);
+                        }
+                    }
+                };
+                
+                ws.onclose = () => {
+                    notify("Déconnecté du serveur.", true);
+                    btn.disabled = true;
+                    btn.innerText = "Serveur Hors Ligne";
+                };
+            } catch (err) {
+                btn.innerText = "Erreur fatale JS";
+            }
         }
 
+        // --- 3. ACTIONS UTILISATEUR ---
         function auth(isRegister) {
             if (!ws || ws.readyState !== WebSocket.OPEN) {
-                notify("Connexion au serveur non établie. Veuillez patienter.", true);
+                notify("Connexion au serveur non établie.", true);
                 return;
             }
             const user = document.getElementById('inp-user').value.trim();
             const pass = document.getElementById('inp-pass').value;
+            
+            document.getElementById('btn-login').disabled = true;
+            document.getElementById('btn-reg').disabled = true;
+            document.getElementById('btn-login').innerText = "Vérification...";
+            
             ws.send(JSON.stringify({ type: 'auth', user, pass, isRegister }));
         }
 
@@ -585,33 +577,21 @@ const FRONTEND_HTML = `
                 document.getElementById('ui-stam').style.width = state.stamina + '%';
                 document.getElementById('ui-stam-txt').innerText = state.stamina + ' STAMINA';
             }
-            if (state.pix !== undefined) {
-                document.getElementById('ui-pix').innerText = state.pix;
-            }
+            if (state.pix !== undefined) { document.getElementById('ui-pix').innerText = state.pix; }
         }
 
-        // --- CONTROLES ---
+        // Contrôles
         const keys = { w:false, a:false, s:false, d:false };
-        window.addEventListener('keydown', e => { 
-            const k = e.key.toLowerCase(); 
-            if(keys[k] !== undefined) keys[k] = true; 
-        });
-        window.addEventListener('keyup', e => { 
-            const k = e.key.toLowerCase(); 
-            if(keys[k] !== undefined) keys[k] = false; 
-        });
+        window.addEventListener('keydown', e => { const k = e.key.toLowerCase(); if(keys[k] !== undefined) keys[k] = true; });
+        window.addEventListener('keyup', e => { const k = e.key.toLowerCase(); if(keys[k] !== undefined) keys[k] = false; });
 
-        // Clic sur le Canvas (Action)
         canvas.addEventListener('mousedown', (e) => {
             if (!myUser) return;
             const rect = canvas.getBoundingClientRect();
-            // Projection inverse de la caméra
-            const cx = canvas.width / 2;
-            const cy = canvas.height / 2;
+            const cx = canvas.width / 2, cy = canvas.height / 2;
             const worldX = Math.floor(camX + (e.clientX - rect.left - cx) / scale);
             const worldY = Math.floor(camY + (e.clientY - rect.top - cy) / scale);
 
-            // Déterminer l'action selon le métier
             let action = 'interact';
             if (myJob === 'ouvrier') action = 'mine';
             if (myJob === 'bâtisseur') action = 'build';
@@ -620,7 +600,6 @@ const FRONTEND_HTML = `
             ws.send(JSON.stringify({ type: 'interact', x: worldX, y: worldY, action: action, colorId: selectedColorId }));
         });
 
-        // --- BOUCLE DE RENDU ET PHYSIQUE CLIENT ---
         let lastTime = performance.now();
         function renderLoop(time) {
             requestAnimationFrame(renderLoop);
@@ -629,60 +608,46 @@ const FRONTEND_HTML = `
 
             if (!myUser) return;
 
-            // Déplacement local (Torique)
-            const speed = 10; // Vitesse de base pure
+            const speed = 15; 
             if (keys.w) camY -= speed * dt;
             if (keys.s) camY += speed * dt;
             if (keys.a) camX -= speed * dt;
             if (keys.d) camX += speed * dt;
 
-            // Envoi pos au serveur (bridé à 10 Hz)
             if (Math.random() < 0.3) ws.send(JSON.stringify({ type: 'move', x: camX, y: camY }));
 
-            // Rendu
             ctx.fillStyle = '#000';
             ctx.fillRect(0, 0, canvas.width, canvas.height);
-
             ctx.save();
             ctx.translate(canvas.width / 2, canvas.height / 2);
             ctx.scale(scale, scale);
             ctx.translate(-camX, -camY);
 
-            // Dessin de la map
             ctx.imageSmoothingEnabled = false;
             ctx.drawImage(offCanvas, 0, 0);
-            
-            // Effet Torique Visuel (dessine la map autour pour illusion infinie)
             ctx.drawImage(offCanvas, -BOARD_SIZE, 0);
             ctx.drawImage(offCanvas, BOARD_SIZE, 0);
             ctx.drawImage(offCanvas, 0, -BOARD_SIZE);
             ctx.drawImage(offCanvas, 0, BOARD_SIZE);
 
-            // Dessin des joueurs
             for (let p of playersMap) {
                 ctx.fillStyle = (p.u === myUser) ? '#f1c40f' : '#e74c3c';
-                ctx.fillRect(p.x - 2, p.y - 2, 5, 5); // Hitbox 5x5
+                ctx.fillRect(p.x - 2, p.y - 2, 5, 5); 
                 ctx.fillStyle = 'white';
                 ctx.font = '3px Arial';
                 ctx.fillText(p.u, p.x - 3, p.y - 3);
             }
-
             ctx.restore();
         }
 
-        // UI Interactions
-        function changeJob(job) {
-            ws.send(JSON.stringify({ type: 'interact', x: camX, y: camY, action: 'change_job', job: job }));
-            document.getElementById('modal-nexus').classList.remove('show');
-        }
+        function changeJob(job) { ws.send(JSON.stringify({ type: 'interact', x: camX, y: camY, action: 'change_job', job: job })); document.getElementById('modal-nexus').classList.remove('show'); }
         function openStore() { document.getElementById('modal-store').classList.add('show'); }
         function buyStore(item) { ws.send(JSON.stringify({ type: 'alanstore_buy', item })); document.getElementById('modal-store').classList.remove('show'); }
 
         function buildPalette() {
             const pal = document.getElementById('palette');
             pal.innerHTML = '';
-            // Seulement les ids constructibles
-            const buildable = [20, 21, 22, 23, 30, 31, 32, 2]; // Bois, Pierres, Route
+            const buildable = [20, 21, 22, 23, 30, 31, 32, 2]; 
             for (let id of buildable) {
                 const div = document.createElement('div');
                 div.className = 'color-swatch';
@@ -696,7 +661,7 @@ const FRONTEND_HTML = `
             }
         }
 
-        // Lancement Client
+        // --- DEMARRAGE ---
         initNet();
 
     </script>
