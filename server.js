@@ -2,7 +2,7 @@
  * PIXEL PLANET - Serveur MMO Hardcore "Single-File"
  * Architecture : Node.js + ws
  * Contrainte : < 512 Mo RAM
- * Version : 1.8 (Correction crash déco AlanStore + Suppression Compte)
+ * Version : 1.9 (Scoreboard TAB, Retrait Délai Métier, UX Améliorée)
  */
 
 const http = require('http');
@@ -168,7 +168,7 @@ wss.on('connection', (ws) => {
                 if (data.isRegister) {
                     if (usersDb[user]) return ws.send(JSON.stringify({ type: 'error', msg: 'Pseudo pris.' }));
                     const spawn = getRandomSpawn(data.spawnNexus);
-                    usersDb[user] = { pass: hashedPass, pix: 200, hp: 100, stamina: 100, job: "chômeur", x: spawn.x, y: spawn.y, inventory: [], vault: [], avatar: DEFAULT_AVATAR, lastJobChange: 0, pvpProtectUntil: 0 };
+                    usersDb[user] = { pass: hashedPass, pix: 200, hp: 100, stamina: 100, job: "chômeur", x: spawn.x, y: spawn.y, inventory: [], vault: [], avatar: DEFAULT_AVATAR, pvpProtectUntil: 0 };
                 } else {
                     if (!usersDb[user] || usersDb[user].pass !== hashedPass) return ws.send(JSON.stringify({ type: 'error', msg: 'Erreur login.' }));
                 }
@@ -190,22 +190,20 @@ wss.on('connection', (ws) => {
             const playerState = activePlayers.get(ws.id);
             const dbRef = usersDb[ws.user];
 
-            // SUPPRESSION COMPTE (GDD)
+            // SUPPRESSION COMPTE
             if (data.type === 'delete_account') {
                 if (dbRef) {
                     if (!alanStore.occasion) alanStore.occasion = [];
-                    // Drop tout (sac + coffre) au marché de l'occasion
                     if (dbRef.inventory && dbRef.inventory.length > 0) alanStore.occasion.push(...dbRef.inventory);
                     if (dbRef.vault && dbRef.vault.length > 0) alanStore.occasion.push(...dbRef.vault);
                     
-                    // Libère les terrains privés (deviennent des ruines publiques)
                     cadastre = cadastre.filter(z => z.owner !== ws.user);
                     
                     delete usersDb[ws.user];
                     activePlayers.delete(ws.id);
                     ws.send(JSON.stringify({ type: 'sys', msg: 'Compte définitivement supprimé.' }));
                     ws.close();
-                    saveFiles(); // Sauvegarde immédiate pour garantir la suppression
+                    saveFiles(); 
                 }
                 return;
             }
@@ -259,10 +257,9 @@ wss.on('connection', (ws) => {
 
             if (data.type === 'change_job') {
                 if (!isNexus(playerState.x, playerState.y)) return ws.send(JSON.stringify({ type: 'error', msg: 'Vous devez être dans le Nexus (Zone Bleue).' }));
-                if (Date.now() - (dbRef.lastJobChange || 0) < 300000) return ws.send(JSON.stringify({ type: 'error', msg: 'Délai de 5 minutes requis entre chaque changement.' }));
                 
-                dbRef.job = data.job; dbRef.lastJobChange = Date.now();
-                ws.send(JSON.stringify({ type: 'sys', msg: `Métier : ${data.job}`}));
+                dbRef.job = data.job; 
+                ws.send(JSON.stringify({ type: 'sys', msg: `Nouveau métier : ${data.job}`}));
                 ws.send(JSON.stringify({ type: 'sync_stats', job: dbRef.job }));
                 return;
             }
@@ -557,19 +554,17 @@ wss.on('connection', (ws) => {
                         const zone = getZone(pState.x, pState.y);
                         if (zone && (zone.owner === ws.user || zone.guests.includes(ws.user))) safeInBase = true;
                     }
-                    // Saisie Hardcore si déco sauvage
                     if (!safeInBase) {
                         if (!alanStore.occasion) alanStore.occasion = [];
                         alanStore.occasion.push(...dbRef.inventory); 
                         dbRef.inventory = [];
-                        console.log(`[OCCASION] Inventaire de ${ws.user} saisi (Déco hors-base).`);
                     }
                 }
                 if (pState) pState.isDriving = null;
                 activePlayers.delete(ws.id); 
                 saveFiles(); 
             }
-        } catch(e) { console.error("Erreur deconnexion", e); }
+        } catch(e) {}
     });
 });
 
@@ -581,7 +576,6 @@ setInterval(() => {
     const now = Date.now();
     const deltas = [];
 
-    // IMPOT FONCIER
     if (now - lastHour > 86400000) { 
         lastHour = now;
         cadastre = cadastre.filter(zone => {
@@ -702,6 +696,10 @@ const FRONTEND_HTML = `
         #notif { position: absolute; top: 70px; left: 50%; transform: translateX(-50%); padding: 10px 20px; border-radius: 20px; font-weight: bold; opacity: 0; transition: opacity 0.3s; z-index: 50; }
         #palette { display: none; position: absolute; bottom: 80px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.8); padding: 10px; border-radius: 10px; pointer-events: auto; gap: 5px; border: 1px solid #444; }
         .color-swatch { width: 25px; height: 25px; border-radius: 5px; cursor: pointer; border: 1px solid #fff; text-align:center; line-height:25px; font-size:12px; font-weight:bold; }
+        
+        #scoreboard { display: none; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 400px; max-height: 80vh; background: rgba(0,0,0,0.9); border: 1px solid #444; border-radius: 10px; z-index: 200; flex-direction: column; padding: 20px; box-sizing: border-box; pointer-events: none; }
+        #scoreboard h2 { color: #3498db; margin-top: 0; text-align: center; border-bottom: 1px solid #444; padding-bottom: 10px; }
+        #score-list { overflow-y: auto; display: flex; flex-direction: column; gap: 5px; }
     </style>
 </head>
 <body>
@@ -750,6 +748,12 @@ const FRONTEND_HTML = `
         </div>
     </div>
 
+    <!-- SCOREBOARD (TAB) -->
+    <div id="scoreboard">
+        <h2>Joueurs Connectés (<span id="score-count">0</span>)</h2>
+        <div id="score-list"></div>
+    </div>
+
     <!-- MODAL LOGIN -->
     <div class="modal show" id="modal-login">
         <h2>PIXEL PLANET</h2>
@@ -765,20 +769,18 @@ const FRONTEND_HTML = `
         <button class="btn" id="btn-reg" onclick="auth(true)" style="background: #8e44ad;" disabled>Patientez...</button>
     </div>
 
-    <!-- MODAL COMPTE (SUPPRESSION) -->
+    <!-- MODAL COMPTE -->
     <div class="modal" id="modal-account" style="width: 400px;">
         <h2>Paramètres du Compte</h2>
         <p>Connecté en tant que : <b id="acc-username" style="color:#3498db"></b></p>
         <p style="font-size:12px; color:#aaa; margin-bottom:20px;">Vos données, terrains et coffres sont liés à ce pseudo.</p>
-        
         <div style="border-top:1px solid #444; padding-top:15px;">
             <p style="color:#e74c3c; font-size:12px; font-weight:bold;">Zone Dangereuse</p>
             <button class="btn" id="btn-init-delete" style="background:#e67e22; width:100%" onclick="document.getElementById('delete-confirm-step').style.display='block'; this.style.display='none';">Supprimer mon compte</button>
-            
             <div id="delete-confirm-step" style="display:none; margin-top: 10px; background:#2c0000; padding:10px; border-radius:5px; border:1px solid #e74c3c;">
                 <p style="color:#e74c3c; font-weight:bold; margin-top:0">Êtes-vous SÛR ?</p>
-                <p style="font-size:11px; color:#ccc;">Vos terrains redeviendront publics et tout votre inventaire/coffre ira aux Occasions.</p>
-                <button class="btn" style="background:#c0392b; width:100%" onclick="ws.send(JSON.stringify({ type: 'delete_account' })); document.getElementById('modal-account').classList.remove('show');">OUI, SUPPRIMER DÉFINITIVEMENT</button>
+                <p style="font-size:11px; color:#ccc;">Vos terrains redeviendront publics et tout ira aux Occasions.</p>
+                <button class="btn" style="background:#c0392b; width:100%" onclick="ws.send(JSON.stringify({ type: 'delete_account' })); document.getElementById('modal-account').classList.remove('show');">OUI, SUPPRIMER</button>
             </div>
         </div>
         <br>
@@ -788,7 +790,7 @@ const FRONTEND_HTML = `
     <!-- MODAL NEXUS -->
     <div class="modal" id="modal-nexus">
         <h2>NEXUS</h2>
-        <p>Changez de métier (Délai 5 min).</p>
+        <p>Changez de métier instantanément.</p>
         <button class="btn" onclick="changeJob('ouvrier')">⛏️ Ouvrier</button>
         <button class="btn" onclick="changeJob('bâtisseur')">🧱 Bâtisseur</button>
         <button class="btn" onclick="changeJob('fermier')">🌾 Fermier</button>
@@ -981,6 +983,7 @@ const FRONTEND_HTML = `
                     }
                     const me = playersMap.find(p => p.u === myUser);
                     if (me) isDriving = me.d;
+                    if(document.getElementById('scoreboard').style.display === 'flex') updateScoreboard();
                 }
             };
             
@@ -1050,13 +1053,43 @@ const FRONTEND_HTML = `
             else container.innerHTML = \`<p>Échoppe de <b>\${shop.owner}</b></p><p style="color:#aaa">Rien à vendre.</p>\`;
         }
 
+        function updateScoreboard() {
+            const list = document.getElementById('score-list');
+            document.getElementById('score-count').innerText = playersMap.length;
+            list.innerHTML = playersMap.map(p => {
+                const isMe = p.u === myUser;
+                return \`<div style="display:flex; justify-content:space-between; background:#111; border:1px solid #333; padding:8px 12px; border-radius:5px;">
+                    <span style="font-weight:bold; color:\${isMe ? '#f1c40f' : 'white'}">\${p.u}</span>
+                    <span style="color:#aaa; font-family:monospace;">X:\${Math.floor(p.x)} Y:\${Math.floor(p.y)}</span>
+                </div>\`;
+            }).join('');
+        }
+
         window.addEventListener('keydown', e => { 
             const k = e.key.toLowerCase();
+            if (k === 'tab') {
+                e.preventDefault();
+                document.getElementById('scoreboard').style.display = 'flex';
+                updateScoreboard();
+                return;
+            }
+            if (document.activeElement.tagName === 'INPUT') return; // N'interfère pas si le joueur tape dans le chat
+            
             if(keys[k] !== undefined) keys[k] = true;
             if(k === 'a' || k === 'q' || k === 'arrowleft') facingRight = false;
             if(k === 'd' || k === 'arrowright') facingRight = true;
         });
-        window.addEventListener('keyup', e => { if(keys[e.key.toLowerCase()] !== undefined) keys[e.key.toLowerCase()] = false; });
+        window.addEventListener('keyup', e => { 
+            const k = e.key.toLowerCase();
+            if (k === 'tab') {
+                e.preventDefault();
+                document.getElementById('scoreboard').style.display = 'none';
+                return;
+            }
+            if (document.activeElement.tagName === 'INPUT') return;
+            
+            if(keys[k] !== undefined) keys[k] = false; 
+        });
 
         let interactInterval = null; let isMouseDown = false; let lastMouseX = 0, lastMouseY = 0;
 
@@ -1066,7 +1099,6 @@ const FRONTEND_HTML = `
             isMouseDown = true; lastMouseX = e.clientX; lastMouseY = e.clientY; 
             
             const act = handleInteract(); 
-            // On ne répète le clic en rafale QUE pour miner, construire ou tirer. On ne rafale pas les ouvertures de menu !
             if (act && act !== 'interact') {
                 interactInterval = setInterval(() => { if (isMouseDown) handleInteract(); }, 200); 
             }
@@ -1086,15 +1118,12 @@ const FRONTEND_HTML = `
 
             let action = 'interact'; 
             
-            // 1. La Gomme du Bâtisseur a la priorité absolue (pour effacer même un bloc spécial)
             if (myJob === 'bâtisseur' && selectedColorId === 255) {
                 action = 'build';
             } 
-            // 2. Cliquer sur un Bloc Spécial force l'ouverture de son interface, peu importe le métier
             else if ([10, 12, 13, 14, 15, 16, 17].includes(targetId)) {
                 action = 'interact';
             } 
-            // 3. Autrement, le Clic Intelligent s'adapte au métier du joueur
             else {
                 if (myJob === 'ouvrier') {
                     if (targetId === 5 || targetId >= 20) action = 'mine';
